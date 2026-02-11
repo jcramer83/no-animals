@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pt
+noanimals_settings.json
+stream_output/
+.claude/
+nul
