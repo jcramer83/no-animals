@@ -15,7 +15,7 @@ import pystray
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SERVER_SCRIPT = os.path.join(SCRIPT_DIR, "stream_animals_v3.py")
-DASHBOARD_URL = "http://localhost:5000"
+DASHBOARD_URL = "http://localhost:8080"
 PYTHON = sys.executable
 
 server_proc = None
@@ -43,9 +43,18 @@ def start_server():
     global server_proc
     if server_proc and server_proc.poll() is None:
         return  # already running
+    env = os.environ.copy()
+    # Ensure FFmpeg is findable even if not on PATH
+    if "FFMPEG_PATH" not in env:
+        ffmpeg_winget = os.path.expandvars(
+            r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.0.1-full_build\bin"
+        )
+        if os.path.isdir(ffmpeg_winget):
+            env["PATH"] = ffmpeg_winget + ";" + env.get("PATH", "")
     server_proc = subprocess.Popen(
         [PYTHON, SERVER_SCRIPT],
         cwd=SCRIPT_DIR,
+        env=env,
         creationflags=subprocess.CREATE_NO_WINDOW | subprocess.ABOVE_NORMAL_PRIORITY_CLASS,
     )
     update_icon_state()
