@@ -1,3 +1,5 @@
+![NoAnimals Banner](banner.png)
+
 # NoAnimals
 
 Real-time video animal censoring system. Detects animals using YOLOv8 on CUDA and censors them with configurable styles. Supports both batch file processing and live IPTV stream processing with a web dashboard.
