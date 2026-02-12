@@ -163,7 +163,16 @@ def probe_stream(url):
         src_w = int(vs.get("width", 0))
         src_h = int(vs.get("height", 0))
         duration = float(info.get("format", {}).get("duration", 0))
-        return {"fps": fps, "has_audio": has_audio, "width": src_w, "height": src_h, "duration": duration}
+        # Find English audio track index (among audio streams only)
+        eng_audio_idx = 0  # default to first audio track
+        audio_streams = [s for s in info["streams"] if s["codec_type"] == "audio"]
+        for i, s in enumerate(audio_streams):
+            lang = s.get("tags", {}).get("language", "").lower()
+            if lang in ("eng", "en", "english"):
+                eng_audio_idx = i
+                break
+        return {"fps": fps, "has_audio": has_audio, "width": src_w, "height": src_h,
+                "duration": duration, "eng_audio_idx": eng_audio_idx}
     except Exception as e:
         print(f"[probe] failed: {e}", flush=True)
         return None
@@ -565,16 +574,19 @@ class StreamInstance:
         self.pad_y = 0
         vf = f"fps={FPS:.2f},scale_cuda={W}:{H},hwdownload,format=nv12"
 
+        dec_cmd += ["-i", self.stream_url]
+        if self.is_vod:
+            dec_cmd += ["-sn"]  # no subtitles/closed captions for VOD
         dec_cmd += [
-            "-i", self.stream_url,
             "-map", "0:v:0",
             "-vf", vf,
             "-pix_fmt", PIX, "-f", "rawvideo",
             f"tcp://127.0.0.1:{self.v_in_port}",
         ]
         if has_audio:
+            audio_idx = probe.get("eng_audio_idx", 0) if self.is_vod else 0
             dec_cmd += [
-                "-map", "0:a:0", "-f", "s16le", "-ar", "48000", "-ac", "2",
+                "-map", f"0:a:{audio_idx}", "-f", "s16le", "-ar", "48000", "-ac", "2",
                 f"tcp://127.0.0.1:{self.a_port}",
             ]
         print(f"[{tag}] decoder: {' '.join(dec_cmd)}", flush=True)
@@ -765,7 +777,10 @@ class StreamInstance:
             ov = OVERLAY_MAP.get(overlay_mode)
             if ov is not None:
                 if self.is_vod:
-                    apply_overlay(frame, ov, 16, 16)
+                    # Bottom-left, 180px from bottom edge to clear letterbox bars
+                    # on even the widest aspect ratios (2.39:1 bars ≈ 138px)
+                    ov_y = H - 180 - ov.shape[0]
+                    apply_overlay(frame, ov, 16, max(0, ov_y))
                 else:
                     ov_y = H - self.pad_y - ov.shape[0] - 16
                     apply_overlay(frame, ov, 16, max(0, ov_y))
@@ -966,16 +981,19 @@ class StreamInstance:
         self.pad_y = 0
         vf = f"fps={FPS:.2f},scale_cuda={W}:{H},hwdownload,format=nv12"
 
+        dec_cmd += ["-i", self.stream_url]
+        if self.is_vod:
+            dec_cmd += ["-sn"]  # no subtitles/closed captions for VOD
         dec_cmd += [
-            "-i", self.stream_url,
             "-map", "0:v:0",
             "-vf", vf,
             "-pix_fmt", PIX, "-f", "rawvideo",
             f"tcp://127.0.0.1:{self.v_in_port}",
         ]
         if has_audio:
+            audio_idx = probe.get("eng_audio_idx", 0) if self.is_vod else 0
             dec_cmd += [
-                "-map", "0:a:0", "-f", "s16le", "-ar", "48000", "-ac", "2",
+                "-map", f"0:a:{audio_idx}", "-f", "s16le", "-ar", "48000", "-ac", "2",
                 f"tcp://127.0.0.1:{self.a_port}",
             ]
         print(f"[{tag}] decoder: {' '.join(dec_cmd)}", flush=True)
@@ -1166,7 +1184,10 @@ class StreamInstance:
             ov = OVERLAY_MAP.get(overlay_mode)
             if ov is not None:
                 if self.is_vod:
-                    apply_overlay(frame, ov, 16, 16)
+                    # Bottom-left, 180px from bottom edge to clear letterbox bars
+                    # on even the widest aspect ratios (2.39:1 bars ≈ 138px)
+                    ov_y = H - 180 - ov.shape[0]
+                    apply_overlay(frame, ov, 16, max(0, ov_y))
                 else:
                     ov_y = H - self.pad_y - ov.shape[0] - 16
                     apply_overlay(frame, ov, 16, max(0, ov_y))
@@ -1678,7 +1699,11 @@ button:active{transform:translateY(0)}
 .status-probing{background:#fdcb6e;box-shadow:0 0 6px rgba(253,203,110,0.5);animation:pulse 1s infinite}
 .status-stopped{background:#666}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
-.stream-card-body{padding:16px 20px}
+.stream-card-body{padding:16px 20px;transition:max-height 0.3s ease,padding 0.3s ease,opacity 0.3s ease;overflow:hidden}
+.stream-card.is-collapsed .stream-card-body{max-height:0;padding:0 20px;opacity:0}
+.stream-card.is-collapsed .stream-card-header{border-bottom:none;padding:12px 20px}
+.stream-card.is-collapsed .stream-card-footer{max-height:0;padding:0 20px;opacity:0;overflow:hidden}
+.stream-card.is-collapsed .error{max-height:0;padding:0 20px;opacity:0;overflow:hidden}
 .stats-row{display:flex;gap:8px;flex-wrap:wrap}
 .mini-stat{flex:1;min-width:80px;background:#0f0f1a;border-radius:8px;padding:10px 8px;text-align:center;border:1px solid rgba(15,52,96,0.4)}
 .mini-stat .label{font-size:0.7em;color:#a0a0b0;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:3px}
@@ -1686,7 +1711,7 @@ button:active{transform:translateY(0)}
 .mini-stat .value.fps-val{color:#53d8fb}
 .mini-stat .value.det-val{color:#e94560}
 .mini-stat .value.viewer-val{color:#00b894}
-.stream-card-footer{padding:10px 20px 14px;display:flex;align-items:center;gap:8px}
+.stream-card-footer{padding:10px 20px 14px;display:flex;align-items:center;gap:8px;transition:max-height 0.3s ease,padding 0.3s ease,opacity 0.3s ease}
 .stream-card-footer code{flex:1;background:#0f0f1a;padding:7px 12px;border-radius:8px;font-size:0.82em;color:#53d8fb;border:1px solid rgba(15,52,96,0.4);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:'SF Mono',Monaco,Consolas,monospace}
 .stream-preview{width:100%;border-bottom:1px solid rgba(15,52,96,0.4);background:#0a0a14;display:none;position:relative;overflow:hidden}
 .stream-preview img{width:100%;display:block;aspect-ratio:16/9;object-fit:contain;background:#000}
@@ -1856,8 +1881,9 @@ function renderStreamCards(stats){
             container.appendChild(card);
             if(d.logo){const el=document.getElementById('logo-'+slug);const img=document.createElement('img');img.className='stream-logo';img.src=d.logo;img.onerror=function(){this.replaceWith(el)};el.parentNode.replaceChild(img,el)}
         }
-        card.className='stream-card'+(d.status==='running'?' is-running':'');
-        const stopBtn=document.getElementById('stopbtn-'+slug);if(stopBtn)stopBtn.style.display=(d.status==='running'||d.status==='probing')?'inline-block':'none';
+        const isActive=d.status==='running'||d.status==='probing';
+        card.className='stream-card'+(d.status==='running'?' is-running':'')+(isActive?'':' is-collapsed');
+        const stopBtn=document.getElementById('stopbtn-'+slug);if(stopBtn)stopBtn.style.display=isActive?'inline-block':'none';
         document.getElementById('chname-'+slug).textContent=d.channel_name||slug;
         document.getElementById('dot-'+slug).className='status-dot status-'+d.status;
         document.getElementById('st-'+slug).textContent=d.status;
@@ -2214,9 +2240,15 @@ def _xc_category_id(group_name):
 @app.route("/panel_api.php", methods=["GET", "POST"])
 def xc_player_api():
     """Xtream Codes API — main endpoint for IPTV apps."""
-    # Support both GET params and POST form data
+    # Support GET params, POST form data, and JSON body
+    _json_body = {}
+    if request.is_json:
+        try:
+            _json_body = request.get_json(silent=True) or {}
+        except Exception:
+            pass
     def _param(key, default=""):
-        return request.args.get(key, "") or request.form.get(key, "") or default
+        return request.args.get(key, "") or request.form.get(key, "") or str(_json_body.get(key, "")) or default
     action = _param("action")
     print(f"[xc-api] {request.method} {request.path} action={action!r} user={_param('username')!r} from={request.remote_addr}", flush=True)
     base = request.host_url.rstrip("/")
@@ -2224,6 +2256,9 @@ def xc_player_api():
 
     # Auth / server info (no action)
     if not action:
+        host_parts = request.host.split(":")
+        server_host = host_parts[0]
+        server_port = host_parts[1] if len(host_parts) > 1 else "8080"
         return jsonify({
             "user_info": {
                 "auth": 1,
@@ -2239,14 +2274,15 @@ def xc_player_api():
                 "allowed_output_formats": ["m3u8", "ts"],
             },
             "server_info": {
-                "url": request.host.split(":")[0],
-                "port": str(request.host.split(":")[-1]) if ":" in request.host else "8080",
-                "https_port": "",
+                "url": server_host,
+                "port": server_port,
+                "https_port": server_port,
                 "server_protocol": "http",
-                "rtmp_port": "",
+                "rtmp_port": server_port,
                 "timezone": "America/Chicago",
                 "timestamp_now": ts,
                 "time_now": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "process": True,
             },
         })
 
@@ -2271,19 +2307,23 @@ def xc_player_api():
                 cat_id = str(_xc_category_id(g))
                 if cat_filter and cat_filter != cat_id:
                     continue
+                sid = int(stream.xui_id) if getattr(stream, "xui_id", "") else i + 1
                 result.append({
                     "num": i + 1,
                     "name": stream.channel_name,
                     "stream_type": "live",
-                    "stream_id": int(stream.xui_id) if getattr(stream, "xui_id", "") else i + 1,
-                    "stream_icon": getattr(stream, "logo", ""),
-                    "epg_channel_id": getattr(stream, "tvg_id", ""),
+                    "stream_id": sid,
+                    "stream_icon": getattr(stream, "logo", "") or "",
+                    "epg_channel_id": getattr(stream, "tvg_id", "") or None,
                     "added": str(ts),
+                    "is_adult": "0",
                     "category_id": cat_id,
+                    "category_ids": [int(cat_id)],
                     "custom_sid": "",
                     "tv_archive": 0,
                     "direct_source": "",
                     "tv_archive_duration": 0,
+                    "thumbnail": "",
                 })
         return jsonify(result)
 
@@ -2317,11 +2357,13 @@ def xc_player_api():
                     "name": movie["name"],
                     "stream_type": "movie",
                     "stream_id": int(xui_id),
-                    "stream_icon": movie.get("logo", ""),
+                    "stream_icon": movie.get("logo", "") or "",
                     "rating": "",
                     "rating_5based": 0,
                     "added": str(ts),
+                    "is_adult": "0",
                     "category_id": cat_id,
+                    "category_ids": [int(cat_id)],
                     "container_extension": movie.get("ext", "mkv"),
                     "custom_sid": "",
                     "direct_source": "",
@@ -2335,14 +2377,43 @@ def xc_player_api():
             movie = vod_catalog.get(vod_id)
         if not movie:
             return jsonify({}), 404
+        ext = movie.get("ext", "mkv")
         return jsonify({
-            "info": {"name": movie["name"], "cover": movie.get("logo", ""),
-                     "plot": "", "genre": re.sub(r'^[│|]\s*', '', movie.get("group", "")),
-                     "duration": ""},
-            "movie_data": {"stream_id": int(vod_id), "container_extension": movie.get("ext", "mkv")},
+            "info": {
+                "name": movie["name"],
+                "title": movie["name"],
+                "cover": movie.get("logo", "") or "",
+                "cover_big": movie.get("logo", "") or "",
+                "movie_image": movie.get("logo", "") or "",
+                "plot": "",
+                "genre": re.sub(r'^[│|]\s*', '', movie.get("group", "")),
+                "duration": "",
+                "duration_secs": 0,
+                "rating": "",
+                "releasedate": "",
+                "director": "",
+                "cast": "",
+                "backdrop_path": [],
+            },
+            "movie_data": {
+                "stream_id": int(vod_id),
+                "name": movie["name"],
+                "added": str(ts),
+                "category_id": str(_xc_category_id(movie.get("group", ""))),
+                "container_extension": ext,
+                "custom_sid": "",
+                "direct_source": "",
+            },
         })
 
-    return jsonify({}), 404
+    # Series stubs — return empty lists for apps that query these
+    if action in ("get_series", "get_series_categories"):
+        return jsonify([])
+    if action == "get_series_info":
+        return jsonify({})
+
+    # Catch-all for unknown actions — return empty JSON (not 404)
+    return jsonify({})
 
 
 @app.route("/get.php")

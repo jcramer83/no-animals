@@ -55,7 +55,9 @@ Same `StreamInstance` class with `is_vod=True`. Key differences from live:
 - **Seeking**: `seek_restart()` kills the current pipeline and restarts with `-ss {offset}` on the decoder and `-output_ts_offset {offset}` on the encoder so PTS timestamps remain continuous. Thread-safe via `_seek_lock`. Probe results are cached (`_cached_probe`) to save ~10s on restarts.
 - **No hardcoded decoder**: Omits `-c:v h264_cuvid` to auto-detect codec (movies may be H.265/HEVC)
 - **No letterboxing**: Movies are scaled directly to `{W}x{H}` regardless of source aspect ratio
-- **Overlay positioned top-left**: VOD overlay is at (16, 16) to stay inside content regardless of aspect ratio. Live streams use bottom-left.
+- **Overlay positioned bottom-left with margin**: VOD overlay is at (16, H-180-overlay_height) — 180px from the bottom edge to clear letterbox bars on widescreen movies (2.39:1 bars ≈ 138px). Live streams use bottom-left adjusted for `pad_y`.
+- **English audio track**: VOD decoder selects the English audio track (`-map 0:a:{eng_idx}`) based on language tags from probe, falling back to first track. Live streams always use first audio track.
+- **No subtitles/CC**: VOD decoder adds `-sn` to strip all subtitle and closed caption streams.
 - **EOF handling**: Sets `self.completed = True` and `status = "completed"` on natural stream end
 - **Cleanup with generation check**: 5-min delayed cleanup after completion, but checks `_pipeline_gen` counter before deleting — if the pipeline was restarted (e.g. resume), cleanup is cancelled.
 - **Auto-restart on resume**: When an IPTV app requests an m3u8 for a VOD whose pipeline is in "listening"/"stopped"/"error" status, the `vod_file()` handler auto-restarts the pipeline (protected by `_seek_lock` to avoid racing with seeks).
@@ -85,14 +87,18 @@ Reads the entire hivecast M3U playlist (same URL for live + VOD):
 
 ### Xtream Codes API Compatibility
 
-Full XC API for IPTV app integration (TiviMate, XCIPTV, etc.):
-- `/player_api.php` (GET/POST): Auth (returns `auth: 1` for any credentials), `get_live_categories`, `get_live_streams`, `get_vod_categories`, `get_vod_streams`, `get_vod_info`
+Full XC API for IPTV app integration (TiviMate, XCIPTV, iPTV Smarters, tvOS apps, etc.):
+- `/player_api.php` (GET/POST/JSON): Auth (returns `auth: 1` for any credentials), `get_live_categories`, `get_live_streams`, `get_vod_categories`, `get_vod_streams`, `get_vod_info`, `get_series`, `get_series_categories`, `get_series_info`
 - `/panel_api.php`: Alias for `/player_api.php`
 - `/get.php`: M3U playlist (calls `noanimals_m3u()`)
 - `/xmltv.php`: Empty XMLTV EPG stub
 - `/live/<user>/<pass>/<stream_id>.<ext>`: Proxies to live HLS pipeline
 - `/movie/<user>/<pass>/<stream_id>.<ext>`: Proxies to VOD HLS pipeline
 - Segment paths under `/live/` and `/movie/` are handled by catch-all `<path:extra>` routes
+- Auth response includes `server_info.process: true` and fully populated fields (required by tvOS apps)
+- Stream objects include `is_adult`, `category_ids` (array), and other fields expected by strict IPTV clients
+- Series endpoints return empty lists (no series support, but apps expect the endpoints to exist)
+- Unknown actions return empty `{}` instead of 404 (some apps treat 404 as login failure)
 
 HLS playlists served through XC routes have segment URLs rewritten to absolute paths (`http://host:port/stream/...` or `/vod/...`) so players resolve segments correctly regardless of the request URL.
 
@@ -110,7 +116,14 @@ Five modes, all with rounded-corner masks (radius scales with box size):
 Six options, pre-rendered as BGRA numpy arrays at module load (zero per-frame PIL cost):
 - **none**, **text** ("NoAnimals"), **graphic** (dog emoji + prohibition sign), **petfree** ("PET FREE TV" badge), **paw** (paw emoji + prohibition sign), **censored** (red stamp)
 
-Applied via `apply_overlay()` using alpha compositing. Live streams: bottom-left (16px margin). VOD: top-left (16, 16) to stay inside content regardless of letterboxing.
+Applied via `apply_overlay()` using alpha compositing. Live streams: bottom-left (16px margin, adjusted for `pad_y` letterbox). VOD: bottom-left, 180px from bottom edge to clear widescreen letterbox bars.
+
+### Dashboard UI
+
+- **Channel cards**: Collapsible — idle channels show compact header only (name, status dot, remove button). Active/probing channels expand to show full stats (FPS, detections, frames, uptime, viewers, resolution), animal counts, preview image, and HLS URL.
+- **Channel filters**: Tag/chip UI below channel cards for adding/removing M3U filter keywords. Triggers re-fetch on change.
+- **Excluded channels**: Removed channels appear as re-addable tags below the filter bar.
+- **Topbar**: Compact M3U URL + Xtream server/user/pass display.
 
 ### Animal Detection & Counting
 
@@ -137,6 +150,7 @@ Applied via `apply_overlay()` using alpha compositing. Live streams: bottom-left
 - **VOD seek decoder flags**: Do NOT add `-analyzeduration 0`, `-probesize 500000`, or `-fflags +fastseek+nobuffer` to the decoder for seeks — causes zero-frame output. Only `-ss` before `-i` is needed.
 - **VOD PTS continuity**: After seek, encoder must use `-output_ts_offset {seek_time}` so PTS timestamps match the synthetic playlist positions. Without this, players see a black screen after seeking.
 - **VOD cleanup race condition**: Delayed cleanup threads must check `_pipeline_gen` before deleting output directories. Without this, a cleanup from a previous pipeline run can delete segments from a newly restarted pipeline.
+- **VOD overlay positioning**: Must be at least 180px from the bottom edge to avoid landing on player-added letterbox bars for widescreen movies. Do NOT use simple bottom-left (16px margin) for VOD — causes letterboxing artifacts.
 
 ## Key Design Decisions
 - **TCP sockets for inter-process video/audio**: Windows anonymous pipes have ~4KB OS buffers, too slow for ~6MB raw 1080p frames.
@@ -147,11 +161,14 @@ Applied via `apply_overlay()` using alpha compositing. Live streams: bottom-left
 - **No VOD catalog persistence**: Rebuilt from M3U on each boot (~2s parsing for 16K movies).
 - **M3U absolute URL rewriting**: HLS playlists served via XC API routes rewrite relative segment filenames to absolute URLs so players fetch segments from correct `/stream/` or `/vod/` paths.
 - **XC API accepts any credentials**: No auth validation — returns `auth: 1` for all username/password combos.
+- **XC API compatibility**: Auth response includes `process: true`, `https_port`, `rtmp_port`; stream objects include `is_adult`, `category_ids`; series endpoints return empty lists; unknown actions return `{}` not 404. These fields are required by strict tvOS IPTV apps.
 - **Preview frames**: Every 30th processed frame is JPEG-encoded (quality 50) and stored on `StreamInstance.last_frame_jpeg`. Dashboard polls `/api/preview/<slug>` with cache-busting timestamp to show live preview images.
 - **Configurable channel filters**: `channel_filters` config array replaces hardcoded "hallmark" check. Dashboard provides tag/chip UI for adding/removing keywords, triggers M3U re-fetch on change.
 - **Per-channel exclusion**: `excluded_channels` config array lets users hide individual discovered channels without removing the filter keyword. Channels can be re-added from the dashboard.
 - **Pipeline generation counter**: `_pipeline_gen` on `StreamInstance` increments each `run_pipeline()` call. Delayed cleanup threads capture the generation at scheduling time and skip deletion if the pipeline was restarted since.
 - **VOD auto-restart on resume**: `vod_file()` detects dead/stale VOD pipelines and restarts them when an IPTV app requests the m3u8 again (e.g. resume playback). Protected by `_seek_lock` to avoid racing with concurrent seeks.
+- **VOD English audio preference**: `probe_stream()` identifies the English audio track by language tag (`eng`/`en`/`english`), VOD decoder maps that track specifically. Falls back to first audio track if no English track found. Live streams always use first audio track.
+- **VOD subtitle stripping**: VOD decoder uses `-sn` to disable all subtitle/CC streams. Prevents closed captions from appearing in transcoded output.
 
 ## Server API
 
@@ -193,7 +210,7 @@ Applied via `apply_overlay()` using alpha compositing. Live streams: bottom-left
 ### Xtream Codes API
 | Route | Method | Purpose |
 |-------|--------|---------|
-| `/player_api.php` | GET/POST | XC auth + actions (get_live_streams, get_vod_streams, etc.) |
+| `/player_api.php` | GET/POST | XC auth + actions (get_live_streams, get_vod_streams, get_series, etc.) |
 | `/panel_api.php` | GET/POST | Alias for player_api.php |
 | `/get.php` | GET | XC M3U playlist |
 | `/xmltv.php` | GET | Empty XMLTV EPG |
