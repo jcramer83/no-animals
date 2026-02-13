@@ -284,7 +284,7 @@ def _load_config():
 
 def _load_m3u_state():
     """Load saved M3U state (url, channels, last_fetched) from settings file."""
-    state = {"m3u_url": "", "channels": [], "last_fetched": None, "last_error": "", "fetching": False}
+    state = {"m3u_url": "", "channels": [], "all_channels": [], "last_fetched": None, "last_error": "", "fetching": False}
     try:
         if SETTINGS_FILE.exists():
             with open(SETTINGS_FILE, "r") as f:
@@ -1265,7 +1265,7 @@ class StreamInstance:
 # ---------------------------------------------------------------------------
 
 def fetch_m3u():
-    """Download M3U playlist, extract Hallmark channels and VOD movies."""
+    """Download M3U playlist, cache all live channel entries and VOD movies."""
     with m3u_lock:
         url = m3u_state["m3u_url"]
         if not url:
@@ -1278,7 +1278,8 @@ def fetch_m3u():
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=60) as resp:
-            channels = []
+            all_channels = []
+            all_slugs = set()
             movies = {}
             pending_extinf = None  # raw #EXTINF line
             for raw_line in resp:
@@ -1288,31 +1289,7 @@ def fetch_m3u():
                     extinf = pending_extinf
                     pending_extinf = None
 
-                    # --- Check for matching live channel ---
-                    # Match filters against tvg-name, tvg-id, and group-title (not logo URLs)
-                    _name_m = re.search(r'tvg-name="([^"]*)"', extinf, re.IGNORECASE)
-                    _tid_m = re.search(r'tvg-id="([^"]*)"', extinf, re.IGNORECASE)
-                    _grp_m = re.search(r'group-title="([^"]*)"', extinf, re.IGNORECASE)
-                    _match_text = ((_name_m.group(1) if _name_m else "") + " " + (_tid_m.group(1) if _tid_m else "") + " " + (_grp_m.group(1) if _grp_m else "")).lower()
-                    with config_lock:
-                        filters = list(config.get("channel_filters", ["hallmark"]))
-                    if any(f in _match_text for f in filters) and len(channels) < MAX_STREAMS:
-                        m = re.search(r'tvg-name="([^"]*)"', extinf, re.IGNORECASE)
-                        name = m.group(1) if m else "Channel"
-                        logo_m = re.search(r'tvg-logo="([^"]*)"', extinf, re.IGNORECASE)
-                        logo = logo_m.group(1) if logo_m else ""
-                        xid_m = re.search(r'xui-id="([^"]*)"', extinf, re.IGNORECASE)
-                        xui_id_ch = xid_m.group(1) if xid_m else ""
-                        tid_m = re.search(r'tvg-id="([^"]*)"', extinf, re.IGNORECASE)
-                        tvg_id_ch = tid_m.group(1) if tid_m else ""
-                        grp_m = re.search(r'group-title="([^"]*)"', extinf, re.IGNORECASE)
-                        group_ch = grp_m.group(1) if grp_m else "United States"
-                        slug = slugify(name)
-                        if not any(c["slug"] == slug for c in channels):
-                            channels.append({"name": name, "url": line, "slug": slug, "logo": logo,
-                                             "xui_id": xui_id_ch, "tvg_id": tvg_id_ch, "group": group_ch})
-
-                    # --- Check for VOD movie (URL ends with #.mkv / #.mp4 / #.avi) ---
+                    # --- Check for VOD movie first (URL ends with #.mkv / #.mp4 / #.avi) ---
                     xui_m = re.search(r'xui-id="([^"]*)"', extinf, re.IGNORECASE)
                     ext_m = re.search(r'#\.(mkv|mp4|avi)$', line, re.IGNORECASE)
                     if xui_m and ext_m:
@@ -1337,21 +1314,36 @@ def fetch_m3u():
                             "group": vod_group,
                             "ext": orig_ext,
                         }
+                        continue
+
+                    # --- Cache live channel entry (all channels, no filter check) ---
+                    _name_m = re.search(r'tvg-name="([^"]*)"', extinf, re.IGNORECASE)
+                    name = _name_m.group(1) if _name_m else "Channel"
+                    slug = slugify(name)
+                    if slug not in all_slugs:
+                        all_slugs.add(slug)
+                        _tid_m = re.search(r'tvg-id="([^"]*)"', extinf, re.IGNORECASE)
+                        tvg_id_ch = _tid_m.group(1) if _tid_m else ""
+                        _grp_m = re.search(r'group-title="([^"]*)"', extinf, re.IGNORECASE)
+                        group_ch = _grp_m.group(1) if _grp_m else "United States"
+                        _logo_m = re.search(r'tvg-logo="([^"]*)"', extinf, re.IGNORECASE)
+                        logo = _logo_m.group(1) if _logo_m else ""
+                        _xid_m = re.search(r'xui-id="([^"]*)"', extinf, re.IGNORECASE)
+                        xui_id_ch = _xid_m.group(1) if _xid_m else ""
+                        _match_text = (name + " " + tvg_id_ch + " " + group_ch).lower()
+                        all_channels.append({"name": name, "url": line, "slug": slug, "logo": logo,
+                                             "xui_id": xui_id_ch, "tvg_id": tvg_id_ch, "group": group_ch,
+                                             "_match_text": _match_text})
 
                 elif line.startswith("#EXTINF"):
                     pending_extinf = line
 
         with m3u_lock:
             m3u_state["fetching"] = False
-            if channels:
-                m3u_state["channels"] = channels
-                m3u_state["last_fetched"] = datetime.now().isoformat()
-                m3u_state["last_error"] = ""
-                for ch in channels:
-                    print(f"[m3u] found: {ch['name']} [{ch['slug']}] -> {ch['url'][:80]}...", flush=True)
-            else:
-                m3u_state["last_error"] = "No Hallmark channels found in playlist"
-                print("[m3u] no hallmark channels found", flush=True)
+            m3u_state["all_channels"] = all_channels
+            m3u_state["last_fetched"] = datetime.now().isoformat()
+            m3u_state["last_error"] = ""
+        print(f"[m3u] cached {len(all_channels)} live channel entries", flush=True)
 
         # Store VOD catalog
         with vod_lock:
@@ -1360,18 +1352,15 @@ def fetch_m3u():
         if movies:
             print(f"[m3u] found {len(movies)} VOD movies", flush=True)
 
-        # Persist M3U state to settings file
-        with config_lock:
-            _save_config()
+        # Apply current filters to cached channels and sync streams
+        count = _apply_filters()
+        print(f"[m3u] {count} channel(s) match current filters", flush=True)
 
-        # Create/update StreamInstance objects
-        _sync_streams(channels)
-
-        # If filters changed while we were fetching, re-fetch with updated filters
+        # If a re-fetch was requested while we were downloading, do it again
         global _m3u_refetch_needed
         if _m3u_refetch_needed:
             _m3u_refetch_needed = False
-            print("[m3u] filters changed during fetch, re-fetching...", flush=True)
+            print("[m3u] re-fetch requested during download, re-fetching...", flush=True)
             fetch_m3u()
 
     except Exception as e:
@@ -1407,6 +1396,33 @@ def _sync_streams(channels):
                 streams[slug].tvg_id = ch.get("tvg_id", "")
                 streams[slug].xui_id = ch.get("xui_id", "")
                 streams[slug].group = ch.get("group", "United States")
+
+
+def _apply_filters():
+    """Re-filter cached all_channels by current channel_filters. Returns channel count, or -1 if cache empty."""
+    with m3u_lock:
+        all_ch = list(m3u_state.get("all_channels", []))
+    if not all_ch:
+        return -1  # Cache not yet populated, need full fetch
+    with config_lock:
+        filters = list(config.get("channel_filters", ["hallmark"]))
+    channels = []
+    seen_slugs = set()
+    for ch in all_ch:
+        if len(channels) >= MAX_STREAMS:
+            break
+        if any(f in ch["_match_text"] for f in filters):
+            if ch["slug"] not in seen_slugs:
+                seen_slugs.add(ch["slug"])
+                channels.append(ch)
+    with m3u_lock:
+        m3u_state["channels"] = channels
+    for ch in channels:
+        print(f"[filter] matched: {ch['name']} [{ch['slug']}]", flush=True)
+    with config_lock:
+        _save_config()
+    _sync_streams(channels)
+    return len(channels)
 
 
 # ---------------------------------------------------------------------------
@@ -2308,8 +2324,8 @@ setInterval(pollM3u,5000);
 let _currentFilters=[],_filterDirty=false;
 function renderFilters(filters){const key=JSON.stringify(filters);if(key===JSON.stringify(_currentFilters)&&!_filterDirty)return;_currentFilters=filters||[];_filterDirty=false;const c=document.getElementById('filterTags');if(!c)return;c.innerHTML='';filters.forEach(f=>{const t=document.createElement('span');t.className='filter-tag';const x=document.createElement('button');x.innerHTML='&#215;';x.onclick=function(e){e.stopPropagation();removeFilter(f)};t.textContent=f+' ';t.appendChild(x);c.appendChild(t)})}
 function setFilterStatus(msg,color){const el=document.getElementById('filterStatus');if(el){el.textContent=msg;el.style.color=color||'#a0a0b0'}}
-function addFilter(){const inp=document.getElementById('filterInput');const raw=inp.value.trim();if(!raw)return;const newKws=raw.split(',').map(s=>s.trim().toLowerCase()).filter(s=>s&&!_currentFilters.includes(s));if(!newKws.length){inp.value='';return}const updated=_currentFilters.concat(newKws);inp.value='';_filterDirty=true;setFilterStatus('Saving\u2026');post('/api/settings',{channel_filters:updated}).then(()=>{renderFilters(updated);setFilterStatus('Fetching channels\u2026');return post('/api/m3u/fetch',{}).then(r=>r.json())}).then(d=>{if(d&&d.queued)setFilterStatus('Queued \u2014 waiting for current fetch\u2026')}).catch(()=>{setFilterStatus('Error','#ff6b6b')})}
-function removeFilter(kw){const updated=_currentFilters.filter(f=>f!==kw);_filterDirty=true;setFilterStatus('Updating\u2026');post('/api/settings',{channel_filters:updated}).then(()=>{renderFilters(updated);setFilterStatus('Fetching channels\u2026');return post('/api/m3u/fetch',{})}).catch(()=>{setFilterStatus('Error','#ff6b6b')})}
+function addFilter(){const inp=document.getElementById('filterInput');const raw=inp.value.trim();if(!raw)return;const newKws=raw.split(',').map(s=>s.trim().toLowerCase()).filter(s=>s&&!_currentFilters.includes(s));if(!newKws.length){inp.value='';return}const updated=_currentFilters.concat(newKws);inp.value='';_filterDirty=true;setFilterStatus('Applying\u2026');post('/api/settings',{channel_filters:updated}).then(r=>r.json()).then(d=>{renderFilters(updated);if(d.channels!=null&&d.channels>=0){const n=d.channels;setFilterStatus(n?'Found '+n+' channel'+(n!==1?'s':''):'No matching channels',n?'#4ecca3':'#ff6b6b');setTimeout(()=>{const fs=document.getElementById('filterStatus');if(fs)fs.textContent=''},5000)}else{setFilterStatus('Fetching channels\u2026');post('/api/m3u/fetch',{})}}).catch(()=>{setFilterStatus('Error','#ff6b6b')})}
+function removeFilter(kw){const updated=_currentFilters.filter(f=>f!==kw);_filterDirty=true;setFilterStatus('Applying\u2026');post('/api/settings',{channel_filters:updated}).then(r=>r.json()).then(d=>{renderFilters(updated);if(d.channels!=null&&d.channels>=0){const n=d.channels;setFilterStatus(n?'Found '+n+' channel'+(n!==1?'s':''):'No matching channels',n?'#4ecca3':'#ff6b6b');setTimeout(()=>{const fs=document.getElementById('filterStatus');if(fs)fs.textContent=''},5000)}else{setFilterStatus('Fetching channels\u2026');post('/api/m3u/fetch',{})}}).catch(()=>{setFilterStatus('Error','#ff6b6b')})}
 let _excludedChannels=[];
 function renderExcluded(discovered,excluded){_excludedChannels=excluded||[];const c=document.getElementById('excludedChannels');if(!c)return;const items=discovered.filter(ch=>excluded.includes(ch.slug));if(!items.length){c.innerHTML='';return}c.innerHTML=items.map(ch=>'<span class="filter-tag" style="background:#1a1a2e;color:#a0a0b0;cursor:pointer" onclick="readdChannel(\''+ch.slug.replace(/'/g,"\\'")+'\')">+ '+ch.name+'</span>').join('')}
 function removeChannel(slug){post('/api/channel/remove/'+slug,{}).catch(()=>{})}
@@ -2456,6 +2472,7 @@ def api_channel_add(slug):
 @app.route("/api/settings", methods=["POST"])
 def api_settings():
     data = request.get_json(force=True)
+    filters_changed = False
     with config_lock:
         for k in ("confidence", "padding", "persist_frames", "smooth_window"):
             if k in data:
@@ -2468,9 +2485,13 @@ def api_settings():
             config["censor_mode"] = data["censor_mode"]
         if "channel_filters" in data:
             config["channel_filters"] = [f.strip().lower() for f in data["channel_filters"] if f.strip()]
+            filters_changed = True
         if "excluded_channels" in data:
             config["excluded_channels"] = [s.strip() for s in data["excluded_channels"] if s.strip()]
         _save_config()
+    if filters_changed:
+        count = _apply_filters()
+        return jsonify({"ok": True, "channels": count})
     return jsonify({"ok": True})
 
 
@@ -2513,7 +2534,8 @@ def api_stats():
 @app.route("/api/m3u")
 def api_m3u_get():
     with m3u_lock:
-        return jsonify(dict(m3u_state))
+        result = {k: v for k, v in m3u_state.items() if k != "all_channels"}
+        return jsonify(result)
 
 
 @app.route("/api/m3u", methods=["POST"])

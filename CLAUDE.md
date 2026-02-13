@@ -74,16 +74,16 @@ Same `StreamInstance` class with `is_vod=True`. Key differences from live:
 ### Shared State (all lock-protected)
 - `config` dict: Detection/censoring settings, persisted to `noanimals_settings.json` on every change. Protected by `config_lock`. Includes `channel_filters` (keyword list for M3U discovery) and `excluded_channels` (slugs to hide from dashboard).
 - `streams` dict (`slug → StreamInstance`): Live stream registry. Protected by `streams_lock`.
-- `m3u_state` dict: M3U playlist URL, discovered channels list, fetch status. Protected by `m3u_lock`.
+- `m3u_state` dict: M3U playlist URL, `all_channels` (full cached list from last fetch), `channels` (filtered list), fetch status. Protected by `m3u_lock`. `all_channels` is memory-only (not persisted); `channels` is persisted to settings for fast boot.
 - `vod_catalog` dict (`xui_id → {name, url, logo, group}`): All discovered VOD movies. Protected by `vod_lock`.
 - `vod_active` dict (`xui_id → StreamInstance`): Currently running VOD pipelines. Protected by `vod_lock`.
 
-### M3U Parsing (`fetch_m3u`)
+### M3U Parsing (`fetch_m3u`) and Channel Filtering (`_apply_filters`)
 
 Reads the entire hivecast M3U playlist (same URL for live + VOD):
-- **Live channels**: Matched by configurable `channel_filters` keywords (default: `["hallmark"]`). Any channel whose EXTINF line contains any filter keyword (case-insensitive) is discovered. Extracts `xui-id`, `tvg-id`, `tvg-name`, `tvg-logo`, `group-title`. Channels in `excluded_channels` config are filtered out by `_sync_streams()`.
-- **VOD movies**: Identified by `xui-id` attribute + URL ending in `#.mkv`/`#.mp4`/`#.avi`. TV show episodes (matching `S\d+E\d+` in name) are filtered out. URL fragment (`#.ext`) stripped before storage. Groups keep their `│` prefix (e.g. `│ Thriller`).
-- Fetched synchronously on boot, then every 3 days or on manual "Fetch Now".
+- **Live channels**: ALL non-VOD entries are cached in `m3u_state["all_channels"]` (~6700 entries) with pre-computed `_match_text` (lowercase concat of tvg-name, tvg-id, group-title). `_apply_filters()` then filters this cache by `channel_filters` keywords — runs in-memory, instant. Channels in `excluded_channels` config are filtered out by `_sync_streams()`.
+- **VOD movies**: Identified by `xui-id` attribute + URL ending in `#.mkv`/`#.mp4`/`#.avi`. Checked first in parsing loop (with `continue`) so VOD entries don't pollute the live channel cache. TV show episodes (matching `S\d+E\d+` in name) are filtered out. URL fragment (`#.ext`) stripped before storage. Groups keep their `│` prefix (e.g. `│ Thriller`).
+- Fetched synchronously on boot, then every 3 days or on manual "Fetch Now". Filter keyword changes do NOT trigger a re-fetch — they re-filter the cached `all_channels` instantly via `_apply_filters()`. If the cache is empty (app just booted, first fetch still running), the frontend falls back to triggering a full fetch.
 
 ### Xtream Codes API Compatibility
 
@@ -121,7 +121,7 @@ Applied via `apply_overlay()` using alpha compositing. Live streams: bottom-left
 ### Dashboard UI
 
 - **Channel cards**: Collapsible — idle channels show compact header only (name, status dot, remove button). Active/probing channels expand to show full stats (FPS, detections, frames, uptime, viewers, resolution), animal counts, preview image, and HLS URL.
-- **Channel filters**: Tag/chip UI below channel cards for adding/removing M3U filter keywords. Triggers re-fetch on change.
+- **Channel filters**: Tag/chip UI below channel cards for adding/removing M3U filter keywords. Re-filters cached channels instantly (no re-download).
 - **Excluded channels**: Removed channels appear as re-addable tags below the filter bar.
 - **Topbar**: Compact M3U URL + Xtream server/user/pass display.
 
@@ -163,7 +163,8 @@ Applied via `apply_overlay()` using alpha compositing. Live streams: bottom-left
 - **XC API accepts any credentials**: No auth validation — returns `auth: 1` for all username/password combos.
 - **XC API compatibility**: Auth response includes `process: true`, `https_port`, `rtmp_port`; stream objects include `is_adult`, `category_ids`; series endpoints return empty lists; unknown actions return `{}` not 404. These fields are required by strict tvOS IPTV apps.
 - **Preview frames**: Every 30th processed frame is JPEG-encoded (quality 50) and stored on `StreamInstance.last_frame_jpeg`. Dashboard polls `/api/preview/<slug>` with cache-busting timestamp to show live preview images.
-- **Configurable channel filters**: `channel_filters` config array replaces hardcoded "hallmark" check. Dashboard provides tag/chip UI for adding/removing keywords, triggers M3U re-fetch on change.
+- **Configurable channel filters**: `channel_filters` config array replaces hardcoded "hallmark" check. Dashboard provides tag/chip UI for adding/removing keywords. Filter changes re-filter cached `all_channels` instantly via `_apply_filters()` — no M3U re-download needed.
+- **M3U channel cache**: `fetch_m3u()` caches ALL live channel entries in `m3u_state["all_channels"]` (not persisted to disk). `_apply_filters()` re-filters this cache by current keywords. `api_settings()` calls `_apply_filters()` when `channel_filters` changes and returns channel count. `api_m3u_get()` excludes `all_channels` from JSON response to keep polls lightweight.
 - **Per-channel exclusion**: `excluded_channels` config array lets users hide individual discovered channels without removing the filter keyword. Channels can be re-added from the dashboard.
 - **Pipeline generation counter**: `_pipeline_gen` on `StreamInstance` increments each `run_pipeline()` call. Delayed cleanup threads capture the generation at scheduling time and skip deletion if the pipeline was restarted since.
 - **VOD auto-restart on resume**: `vod_file()` detects dead/stale VOD pipelines and restarts them when an IPTV app requests the m3u8 again (e.g. resume playback). Protected by `_seek_lock` to avoid racing with concurrent seeks.
