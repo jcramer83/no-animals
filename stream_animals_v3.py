@@ -323,6 +323,7 @@ streams = {}  # slug -> StreamInstance
 
 m3u_lock = threading.Lock()
 m3u_state = _load_m3u_state()
+_m3u_refetch_needed = False  # set True when filters change during an active fetch
 
 vod_lock = threading.Lock()
 vod_catalog = {}   # xui_id (str) -> {xui_id, name, url, logo, group}
@@ -1288,10 +1289,14 @@ def fetch_m3u():
                     pending_extinf = None
 
                     # --- Check for matching live channel ---
-                    extinf_lower = extinf.lower()
+                    # Match filters against tvg-name, tvg-id, and group-title (not logo URLs)
+                    _name_m = re.search(r'tvg-name="([^"]*)"', extinf, re.IGNORECASE)
+                    _tid_m = re.search(r'tvg-id="([^"]*)"', extinf, re.IGNORECASE)
+                    _grp_m = re.search(r'group-title="([^"]*)"', extinf, re.IGNORECASE)
+                    _match_text = ((_name_m.group(1) if _name_m else "") + " " + (_tid_m.group(1) if _tid_m else "") + " " + (_grp_m.group(1) if _grp_m else "")).lower()
                     with config_lock:
                         filters = list(config.get("channel_filters", ["hallmark"]))
-                    if any(f in extinf_lower for f in filters) and len(channels) < MAX_STREAMS:
+                    if any(f in _match_text for f in filters) and len(channels) < MAX_STREAMS:
                         m = re.search(r'tvg-name="([^"]*)"', extinf, re.IGNORECASE)
                         name = m.group(1) if m else "Channel"
                         logo_m = re.search(r'tvg-logo="([^"]*)"', extinf, re.IGNORECASE)
@@ -1361,6 +1366,13 @@ def fetch_m3u():
 
         # Create/update StreamInstance objects
         _sync_streams(channels)
+
+        # If filters changed while we were fetching, re-fetch with updated filters
+        global _m3u_refetch_needed
+        if _m3u_refetch_needed:
+            _m3u_refetch_needed = False
+            print("[m3u] filters changed during fetch, re-fetching...", flush=True)
+            fetch_m3u()
 
     except Exception as e:
         with m3u_lock:
@@ -1556,6 +1568,272 @@ def _build_censored_overlay():
     return arr
 
 
+def _build_shield_overlay():
+    """Render shield with 'NA' monogram as BGRA numpy array."""
+    size = 96
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    shield_points = [
+        (48, 8), (80, 18), (82, 50), (72, 70), (48, 88),
+        (24, 70), (14, 50), (16, 18),
+    ]
+    draw.polygon(shield_points, fill=(15, 15, 35, 200), outline=(233, 69, 96, 240))
+    inset = [(int(48 + (x-48)*0.92), int(48 + (y-48)*0.92)) for x, y in shield_points]
+    draw.polygon(inset, outline=(233, 69, 96, 180))
+    try:
+        font = ImageFont.truetype("segoeuib.ttf", 32)
+    except OSError:
+        try:
+            font = ImageFont.truetype("arialbd.ttf", 32)
+        except OSError:
+            font = ImageFont.load_default()
+    bbox = draw.textbbox((0, 0), "NA", font=font)
+    tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
+    draw.text((48 - tw//2 - bbox[0], 40 - th//2 - bbox[1]), "NA", font=font, fill=(255, 255, 255, 240))
+    arr = np.array(img)
+    arr[:, :, :3] = arr[:, :, 2::-1]
+    return arr
+
+
+def _build_tvrating_overlay():
+    """Render 'TV-NA' rating badge as BGRA numpy array."""
+    try:
+        font = ImageFont.truetype("segoeuib.ttf", 20)
+    except OSError:
+        try:
+            font = ImageFont.truetype("arialbd.ttf", 20)
+        except OSError:
+            font = ImageFont.load_default()
+    tmp = Image.new("RGBA", (1, 1))
+    d = ImageDraw.Draw(tmp)
+    bbox = d.textbbox((0, 0), "TV-NA", font=font)
+    tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
+    pad_x, pad_y = 10, 6
+    w, h = tw + pad_x*2, th + pad_y*2
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle([0, 0, w-1, h-1], radius=4, fill=(0, 0, 0, 180), outline=(255, 255, 255, 200), width=2)
+    bbox_tv = draw.textbbox((0, 0), "TV-", font=font)
+    tv_w = bbox_tv[2] - bbox_tv[0]
+    draw.text((pad_x - bbox[0], pad_y - bbox[1]), "TV-", font=font, fill=(255, 255, 255, 230))
+    draw.text((pad_x - bbox[0] + tv_w, pad_y - bbox[1]), "NA", font=font, fill=(233, 69, 96, 240))
+    arr = np.array(img)
+    arr[:, :, :3] = arr[:, :, 2::-1]
+    return arr
+
+
+def _build_cleanstream_overlay():
+    """Render 'CLEAN STREAM' two-line badge as BGRA numpy array."""
+    try:
+        font = ImageFont.truetype("segoeuib.ttf", 18)
+    except OSError:
+        try:
+            font = ImageFont.truetype("arialbd.ttf", 18)
+        except OSError:
+            font = ImageFont.load_default()
+    tmp = Image.new("RGBA", (1, 1))
+    d = ImageDraw.Draw(tmp)
+    bbox1 = d.textbbox((0, 0), "CLEAN", font=font)
+    bbox2 = d.textbbox((0, 0), "STREAM", font=font)
+    tw1, th1 = bbox1[2]-bbox1[0], bbox1[3]-bbox1[1]
+    tw2, th2 = bbox2[2]-bbox2[0], bbox2[3]-bbox2[1]
+    max_tw = max(tw1, tw2)
+    pad = 10
+    spacing = 4
+    w = max_tw + pad*2
+    h = th1 + th2 + spacing + pad*2
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle([0, 0, w-1, h-1], radius=8, fill=(15, 52, 96, 190), outline=(83, 216, 251, 200), width=2)
+    y1 = pad - bbox1[1]
+    y2 = pad + th1 + spacing - bbox2[1]
+    draw.text(((w - tw1)//2 - bbox1[0], y1), "CLEAN", font=font, fill=(255, 255, 255, 240))
+    draw.text(((w - tw2)//2 - bbox2[0], y2), "STREAM", font=font, fill=(83, 216, 251, 240))
+    arr = np.array(img)
+    arr[:, :, :3] = arr[:, :, 2::-1]
+    return arr
+
+
+def _build_lock_overlay():
+    """Render padlock with checkmark as BGRA numpy array."""
+    size = 80
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle([18, 34, 62, 72], radius=6, fill=(15, 52, 96, 200), outline=(83, 216, 251, 220), width=2)
+    draw.line([(28, 36), (28, 22)], fill=(83, 216, 251, 220), width=3)
+    draw.line([(52, 36), (52, 22)], fill=(83, 216, 251, 220), width=3)
+    draw.arc([28, 12, 52, 34], 180, 360, fill=(83, 216, 251, 220), width=3)
+    draw.line([(30, 52), (38, 62), (54, 44)], fill=(80, 220, 120, 240), width=3)
+    arr = np.array(img)
+    arr[:, :, :3] = arr[:, :, 2::-1]
+    return arr
+
+
+def _build_filmstrip_overlay():
+    """Render film strip frame with NoAnimals branding as BGRA numpy array."""
+    w, h = 100, 64
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle([0, 0, w-1, h-1], radius=4, fill=(20, 20, 30, 190))
+    for x in range(6, w-6, 14):
+        draw.rounded_rectangle([x, 2, x+8, 10], radius=2, outline=(160, 160, 180, 180))
+    for x in range(6, w-6, 14):
+        draw.rounded_rectangle([x, h-11, x+8, h-3], radius=2, outline=(160, 160, 180, 180))
+    draw.line([(0, 12), (w, 12)], fill=(160, 160, 180, 160), width=1)
+    draw.line([(0, h-12), (w, h-12)], fill=(160, 160, 180, 160), width=1)
+    try:
+        font_na = ImageFont.truetype("segoeuib.ttf", 16)
+    except OSError:
+        try:
+            font_na = ImageFont.truetype("arialbd.ttf", 16)
+        except OSError:
+            font_na = ImageFont.load_default()
+    bbox = draw.textbbox((0, 0), "NoAnimals", font=font_na)
+    tw_full = bbox[2]-bbox[0]
+    th_full = bbox[3]-bbox[1]
+    bbox_no = draw.textbbox((0, 0), "No", font=font_na)
+    no_w = bbox_no[2]-bbox_no[0]
+    x_start = (w - tw_full)//2 - bbox[0]
+    y_start = (h - th_full)//2 - bbox[1]
+    draw.text((x_start, y_start), "No", font=font_na, fill=(233, 69, 96, 240))
+    draw.text((x_start + no_w, y_start), "Animals", font=font_na, fill=(255, 255, 255, 230))
+    arr = np.array(img)
+    arr[:, :, :3] = arr[:, :, 2::-1]
+    return arr
+
+
+def _build_nocat_overlay():
+    """Render cat emoji with prohibition sign as BGRA numpy array."""
+    size = 96
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    cx, cy, r = size // 2, size // 2, 42
+    try:
+        efont = ImageFont.truetype("seguiemj.ttf", 52)
+        cat = "\U0001F408"
+        bbox = draw.textbbox((0, 0), cat, font=efont)
+        tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
+        x = (size - tw)//2 - bbox[0]
+        y = (size - th)//2 - bbox[1] + 2
+        draw.text((x, y), cat, font=efont, embedded_color=True)
+    except (OSError, AttributeError):
+        draw.ellipse([24, 24, 72, 72], fill=(180, 160, 140, 200))
+    ring_w = 5
+    draw.ellipse([cx-r, cy-r, cx+r, cy+r], outline=(233, 69, 96, 230), width=ring_w)
+    offset = int(r * 0.7071)
+    draw.line([(cx-offset, cy-offset), (cx+offset, cy+offset)], fill=(233, 69, 96, 230), width=ring_w)
+    arr = np.array(img)
+    arr[:, :, :3] = arr[:, :, 2::-1]
+    return arr
+
+
+def _build_poweredby_overlay():
+    """Render 'Powered by NoAnimals' tag as BGRA numpy array."""
+    try:
+        font_sm = ImageFont.truetype("segoeui.ttf", 13)
+    except OSError:
+        try:
+            font_sm = ImageFont.truetype("arial.ttf", 13)
+        except OSError:
+            font_sm = ImageFont.load_default()
+    try:
+        font_brand = ImageFont.truetype("segoeuib.ttf", 16)
+    except OSError:
+        try:
+            font_brand = ImageFont.truetype("arialbd.ttf", 16)
+        except OSError:
+            font_brand = ImageFont.load_default()
+    tmp = Image.new("RGBA", (1, 1))
+    d = ImageDraw.Draw(tmp)
+    pb_bbox = d.textbbox((0, 0), "Powered by ", font=font_sm)
+    na_bbox = d.textbbox((0, 0), "NoAnimals", font=font_brand)
+    pb_w = pb_bbox[2]-pb_bbox[0]
+    total_w = pb_w + (na_bbox[2]-na_bbox[0])
+    max_h = max(pb_bbox[3]-pb_bbox[1], na_bbox[3]-na_bbox[1])
+    pad_x, pad_y = 10, 6
+    w = total_w + pad_x*2
+    h = max_h + pad_y*2
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle([0, 0, w-1, h-1], radius=6, fill=(0, 0, 0, 140))
+    y_txt = pad_y + (max_h - (pb_bbox[3]-pb_bbox[1]))//2 - pb_bbox[1]
+    draw.text((pad_x - pb_bbox[0], y_txt), "Powered by ", font=font_sm, fill=(160, 160, 170, 200))
+    na_bbox2 = d.textbbox((0, 0), "No", font=font_brand)
+    no_w2 = na_bbox2[2]-na_bbox2[0]
+    y_brand = pad_y + (max_h - (na_bbox[3]-na_bbox[1]))//2 - na_bbox[1]
+    x_brand = pad_x + pb_w - na_bbox[0]
+    draw.text((x_brand, y_brand), "No", font=font_brand, fill=(233, 69, 96, 230))
+    draw.text((x_brand + no_w2, y_brand), "Animals", font=font_brand, fill=(255, 255, 255, 230))
+    arr = np.array(img)
+    arr[:, :, :3] = arr[:, :, 2::-1]
+    return arr
+
+
+def _build_eyeslash_overlay():
+    """Render eye with slash icon as BGRA numpy array."""
+    size = 80
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse([14, 28, 66, 52], outline=(200, 200, 220, 220), width=2)
+    draw.ellipse([30, 32, 50, 48], fill=(83, 216, 251, 200), outline=(200, 200, 220, 220), width=1)
+    draw.ellipse([36, 36, 44, 44], fill=(15, 15, 35, 230))
+    draw.ellipse([37, 34, 41, 38], fill=(255, 255, 255, 180))
+    draw.line([(16, 16), (64, 64)], fill=(233, 69, 96, 230), width=4)
+    arr = np.array(img)
+    arr[:, :, :3] = arr[:, :, 2::-1]
+    return arr
+
+
+def _build_filtered_overlay():
+    """Render 'FILTERED' green stamp as BGRA numpy array."""
+    try:
+        font = ImageFont.truetype("segoeuib.ttf", 24)
+    except OSError:
+        try:
+            font = ImageFont.truetype("arialbd.ttf", 24)
+        except OSError:
+            font = ImageFont.load_default()
+    tmp = Image.new("RGBA", (1, 1))
+    d = ImageDraw.Draw(tmp)
+    bbox = d.textbbox((0, 0), "FILTERED", font=font)
+    tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
+    pad_x, pad_y = 14, 8
+    w, h = tw + pad_x*2, th + pad_y*2
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle([2, 2, w-3, h-3], radius=4, outline=(80, 220, 120, 200), width=3)
+    draw.rounded_rectangle([6, 6, w-7, h-7], radius=2, outline=(80, 220, 120, 140), width=1)
+    draw.text((pad_x - bbox[0], pad_y - bbox[1]), "FILTERED", font=font, fill=(80, 220, 120, 210))
+    arr = np.array(img)
+    arr[:, :, :3] = arr[:, :, 2::-1]
+    return arr
+
+
+def _build_nohorse_overlay():
+    """Render horse emoji with prohibition sign as BGRA numpy array."""
+    size = 96
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    cx, cy, r = size // 2, size // 2, 42
+    try:
+        efont = ImageFont.truetype("seguiemj.ttf", 52)
+        horse = "\U0001F434"
+        bbox = draw.textbbox((0, 0), horse, font=efont)
+        tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
+        x = (size - tw)//2 - bbox[0]
+        y = (size - th)//2 - bbox[1]
+        draw.text((x, y), horse, font=efont, embedded_color=True)
+    except (OSError, AttributeError):
+        draw.ellipse([24, 24, 72, 72], fill=(180, 140, 100, 200))
+    ring_w = 5
+    draw.ellipse([cx-r, cy-r, cx+r, cy+r], outline=(233, 69, 96, 230), width=ring_w)
+    offset = int(r * 0.7071)
+    draw.line([(cx-offset, cy-offset), (cx+offset, cy+offset)], fill=(233, 69, 96, 230), width=ring_w)
+    arr = np.array(img)
+    arr[:, :, :3] = arr[:, :, 2::-1]
+    return arr
+
+
 def _overlay_to_png_b64(overlay_bgra):
     """Convert a BGRA numpy overlay to a base64-encoded PNG data URI."""
     rgba = overlay_bgra.copy()
@@ -1566,17 +1844,53 @@ def _overlay_to_png_b64(overlay_bgra):
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
+def _load_png_overlay(filename, size=120):
+    """Load a PNG overlay image, resize, and convert RGBA to BGRA numpy array."""
+    path = Path(__file__).parent / filename
+    img = Image.open(path).convert("RGBA")
+    img = img.resize((size, size), Image.LANCZOS)
+    arr = np.array(img)
+    arr[:, :, :3] = arr[:, :, 2::-1]  # RGBA -> BGRA
+    return arr
+
+
 TEXT_OVERLAY = _build_text_overlay()
 GRAPHIC_OVERLAY = _build_graphic_overlay()
 PETFREE_OVERLAY = _build_petfree_overlay()
 PAW_OVERLAY = _build_paw_overlay()
 CENSORED_OVERLAY = _build_censored_overlay()
+SHIELD_OVERLAY = _build_shield_overlay()
+TVRATING_OVERLAY = _build_tvrating_overlay()
+CLEANSTREAM_OVERLAY = _build_cleanstream_overlay()
+LOCK_OVERLAY = _build_lock_overlay()
+FILMSTRIP_OVERLAY = _build_filmstrip_overlay()
+NOCAT_OVERLAY = _build_nocat_overlay()
+POWEREDBY_OVERLAY = _build_poweredby_overlay()
+EYESLASH_OVERLAY = _build_eyeslash_overlay()
+FILTERED_OVERLAY = _build_filtered_overlay()
+NOHORSE_OVERLAY = _build_nohorse_overlay()
+NODOG_OVERLAY = _load_png_overlay("overlay_nodog.png", 120)
+NOPAW_OVERLAY = _load_png_overlay("overlay_nopaw.png", 120)
+ANIMALFREE_OVERLAY = _load_png_overlay("overlay_animalfree.png", 120)
 OVERLAY_MAP = {
     "text": TEXT_OVERLAY,
     "graphic": GRAPHIC_OVERLAY,
     "petfree": PETFREE_OVERLAY,
     "paw": PAW_OVERLAY,
     "censored": CENSORED_OVERLAY,
+    "shield": SHIELD_OVERLAY,
+    "tvrating": TVRATING_OVERLAY,
+    "cleanstream": CLEANSTREAM_OVERLAY,
+    "lock": LOCK_OVERLAY,
+    "filmstrip": FILMSTRIP_OVERLAY,
+    "nocat": NOCAT_OVERLAY,
+    "poweredby": POWEREDBY_OVERLAY,
+    "eyeslash": EYESLASH_OVERLAY,
+    "filtered": FILTERED_OVERLAY,
+    "nohorse": NOHORSE_OVERLAY,
+    "nodog": NODOG_OVERLAY,
+    "nopaw": NOPAW_OVERLAY,
+    "animalfree": ANIMALFREE_OVERLAY,
 }
 OVERLAY_PREVIEWS = {k: _overlay_to_png_b64(v) for k, v in OVERLAY_MAP.items()}
 
@@ -1672,6 +1986,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .row input[type=range]{flex:1;accent-color:#e94560}
 .row select{flex:1;padding:8px 12px;border-radius:8px;border:1px solid #0f3460;background:#0f0f1a;color:#e0e0e0;font-size:0.9em}
 .row .val{min-width:44px;text-align:right;font-family:'SF Mono',Monaco,Consolas,monospace;font-size:0.85em;color:#53d8fb}
+.setting-desc{font-size:0.72em;color:#666;margin:-6px 0 10px 130px;line-height:1.3}
 button{padding:8px 20px;border-radius:8px;border:none;cursor:pointer;font-size:0.85em;font-weight:600;transition:all 0.2s}
 button:hover{transform:translateY(-1px);box-shadow:0 2px 8px rgba(0,0,0,0.3)}
 button:active{transform:translateY(0)}
@@ -1752,6 +2067,8 @@ No channels discovered yet. Configure M3U source below and click Fetch Now.
 <input type="text" id="filterInput" placeholder="add keyword..." style="padding:6px 10px;border-radius:8px;border:1px solid #0f3460;background:#0f0f1a;color:#e0e0e0;font-size:0.82em;width:150px" onkeydown="if(event.key==='Enter')addFilter()">
 <button class="btn-start" style="padding:5px 12px;font-size:0.78em" onclick="addFilter()">Add</button>
 </div>
+<span id="filterStatus" style="font-size:0.75em;color:#a0a0b0;margin-left:4px"></span>
+</div>
 <div id="excludedChannels" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px"></div>
 </div>
 </div>
@@ -1777,19 +2094,24 @@ No channels discovered yet. Configure M3U source below and click Fetch Now.
 </div></div>
 
 <div class="card">
-<h2 class="collapsible-toggle" onclick="toggleCollapse(this)">Detection</h2>
+<h2 class="collapsible-toggle" onclick="toggleCollapse(this)">ML Animal Detection</h2>
 <div class="collapsible-body">
 <div class="row"><label>Confidence</label><input type="range" id="confidence" min="0.05" max="0.9" step="0.05" value="0.4"><span class="val" id="confidenceVal">0.40</span></div>
+<div class="setting-desc">Min score to count as a detection. Lower catches more but may false-positive.</div>
 <div class="row"><label>Padding</label><input type="range" id="padding" min="0" max="100" step="5" value="30"><span class="val" id="paddingVal">30</span></div>
-<div class="row"><label>Persist</label><input type="range" id="persist" min="1" max="30" step="1" value="2"><span class="val" id="persistVal">2</span></div>
-<div class="row"><label>Smooth</label><input type="range" id="smooth" min="1" max="15" step="1" value="5"><span class="val" id="smoothVal">5</span></div>
-<div class="row"><label>Model</label><select id="model">
+<div class="setting-desc">Extra pixels added around each detected box to ensure full coverage.</div>
+<div class="row"><label>Persist Frames</label><input type="range" id="persist" min="1" max="30" step="1" value="2"><span class="val" id="persistVal">2</span></div>
+<div class="setting-desc">Frames to keep censoring after detection is lost. Prevents flicker.</div>
+<div class="row"><label>Smooth Window</label><input type="range" id="smooth" min="1" max="15" step="1" value="5"><span class="val" id="smoothVal">5</span></div>
+<div class="setting-desc">Frames to average box position over. Higher = steadier boxes, slower to react.</div>
+<div class="row"><label>YOLO Model</label><select id="model">
 <option value="yolov8n.pt">yolov8n (fast)</option>
 <option value="yolov8s.pt">yolov8s (balanced)</option>
 <option value="yolov8m.pt">yolov8m</option>
 <option value="yolov8l.pt">yolov8l</option>
 <option value="yolov8x.pt" selected>yolov8x (accurate)</option>
 </select></div>
+<div class="setting-desc">YOLOv8 model size. Larger = more accurate but uses more GPU.</div>
 <div class="row"><label>Censor Style</label><select id="censorMode">
 <option value="black">Black box</option>
 <option value="blur">Blur</option>
@@ -1797,6 +2119,7 @@ No channels discovered yet. Configure M3U source below and click Fetch Now.
 <option value="pixelate" selected>Pixelate</option>
 <option value="color_match">Color match</option>
 </select></div>
+<div class="setting-desc">How detected animals are hidden in the video output.</div>
 </div></div>
 
 <div class="card">
@@ -1809,10 +2132,23 @@ No channels discovered yet. Configure M3U source below and click Fetch Now.
 <option value="petfree">Pet Free TV</option>
 <option value="paw">No paws</option>
 <option value="censored">CENSORED</option>
+<option value="shield">Shield NA</option>
+<option value="tvrating">TV-NA</option>
+<option value="cleanstream">Clean Stream</option>
+<option value="lock">Lock safe</option>
+<option value="filmstrip">Film strip</option>
+<option value="nocat">No cats</option>
+<option value="poweredby">Powered by</option>
+<option value="eyeslash">Eye slash</option>
+<option value="filtered">FILTERED</option>
+<option value="nohorse">No horses</option>
+<option value="nodog">No dog sign</option>
+<option value="nopaw">Paw X-out</option>
+<option value="animalfree">Animal free</option>
 </select></div>
 <div id="overlayPreview" style="margin-top:10px;background:#1a1a2e;border:1px solid #0f3460;border-radius:8px;padding:16px;display:flex;align-items:center;justify-content:center;min-height:60px">
 <span style="color:#555;font-size:0.82em" id="overlayPreviewOff">No overlay active</span>
-<img id="overlayPreviewImg" style="display:none;max-height:80px;image-rendering:pixelated" alt="Overlay preview">
+<img id="overlayPreviewImg" style="display:none;max-height:120px;image-rendering:pixelated" alt="Overlay preview">
 </div>
 </div></div>
 </div>
@@ -1961,7 +2297,7 @@ function poll(){fetch('/api/stats').then(r=>r.json()).then(d=>{const vodData=d._
 setInterval(poll,2000);poll();
 
 function fmtDate(iso){if(!iso)return'Never';const d=new Date(iso);return d.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'})+' '+d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'})}
-function updateM3u(d){document.getElementById('m3uLastFetched').textContent=fmtDate(d.last_fetched);document.getElementById('m3uError').textContent=d.last_error||'';document.getElementById('m3uFetchBtn').textContent=d.fetching?'Fetching\u2026':'Fetch Now';document.getElementById('m3uFetchBtn').disabled=d.fetching}
+function updateM3u(d){document.getElementById('m3uLastFetched').textContent=fmtDate(d.last_fetched);document.getElementById('m3uError').textContent=d.last_error||'';document.getElementById('m3uFetchBtn').textContent=d.fetching?'Fetching\u2026':'Fetch Now';document.getElementById('m3uFetchBtn').disabled=d.fetching;const fs=document.getElementById('filterStatus');if(fs&&fs.textContent){if(d.fetching){if(fs.textContent.indexOf('Queued')===-1)fs.textContent='Fetching channels\u2026'}else{const n=(d.channels||[]).length;fs.textContent=n?'Found '+n+' channel'+(n!==1?'s':''):'No matching channels';fs.style.color=n?'#4ecca3':'#ff6b6b';setTimeout(()=>{if(fs)fs.textContent=''},5000)}}}
 function pollM3u(){fetch('/api/m3u').then(r=>r.json()).then(updateM3u).catch(()=>{})}
 function fetchM3u(){document.getElementById('m3uFetchBtn').textContent='Fetching\u2026';document.getElementById('m3uFetchBtn').disabled=true;post('/api/m3u/fetch',{}).then(()=>setTimeout(pollM3u,2000)).catch(()=>{document.getElementById('m3uFetchBtn').textContent='Fetch Now';document.getElementById('m3uFetchBtn').disabled=false})}
 function saveM3u(){const u=document.getElementById('m3uUrl').value.trim();if(!u)return;post('/api/m3u',{m3u_url:u,fetch:true}).then(()=>{document.getElementById('m3uSaveBtn').textContent='Saved!';setTimeout(()=>{document.getElementById('m3uSaveBtn').textContent='Save';pollM3u()},2000)}).catch(()=>{})}
@@ -1971,8 +2307,9 @@ fetch('/api/m3u').then(r=>r.json()).then(d=>{if(d.m3u_url)document.getElementByI
 setInterval(pollM3u,5000);
 let _currentFilters=[],_filterDirty=false;
 function renderFilters(filters){const key=JSON.stringify(filters);if(key===JSON.stringify(_currentFilters)&&!_filterDirty)return;_currentFilters=filters||[];_filterDirty=false;const c=document.getElementById('filterTags');if(!c)return;c.innerHTML='';filters.forEach(f=>{const t=document.createElement('span');t.className='filter-tag';const x=document.createElement('button');x.innerHTML='&#215;';x.onclick=function(e){e.stopPropagation();removeFilter(f)};t.textContent=f+' ';t.appendChild(x);c.appendChild(t)})}
-function addFilter(){const inp=document.getElementById('filterInput');const raw=inp.value.trim();if(!raw)return;const newKws=raw.split(',').map(s=>s.trim().toLowerCase()).filter(s=>s&&!_currentFilters.includes(s));if(!newKws.length){inp.value='';return}const updated=_currentFilters.concat(newKws);inp.value='';_filterDirty=true;post('/api/settings',{channel_filters:updated}).then(()=>{renderFilters(updated);post('/api/m3u/fetch',{})}).catch(()=>{})}
-function removeFilter(kw){const updated=_currentFilters.filter(f=>f!==kw);_filterDirty=true;post('/api/settings',{channel_filters:updated}).then(()=>{renderFilters(updated);post('/api/m3u/fetch',{})}).catch(()=>{})}
+function setFilterStatus(msg,color){const el=document.getElementById('filterStatus');if(el){el.textContent=msg;el.style.color=color||'#a0a0b0'}}
+function addFilter(){const inp=document.getElementById('filterInput');const raw=inp.value.trim();if(!raw)return;const newKws=raw.split(',').map(s=>s.trim().toLowerCase()).filter(s=>s&&!_currentFilters.includes(s));if(!newKws.length){inp.value='';return}const updated=_currentFilters.concat(newKws);inp.value='';_filterDirty=true;setFilterStatus('Saving\u2026');post('/api/settings',{channel_filters:updated}).then(()=>{renderFilters(updated);setFilterStatus('Fetching channels\u2026');return post('/api/m3u/fetch',{}).then(r=>r.json())}).then(d=>{if(d&&d.queued)setFilterStatus('Queued \u2014 waiting for current fetch\u2026')}).catch(()=>{setFilterStatus('Error','#ff6b6b')})}
+function removeFilter(kw){const updated=_currentFilters.filter(f=>f!==kw);_filterDirty=true;setFilterStatus('Updating\u2026');post('/api/settings',{channel_filters:updated}).then(()=>{renderFilters(updated);setFilterStatus('Fetching channels\u2026');return post('/api/m3u/fetch',{})}).catch(()=>{setFilterStatus('Error','#ff6b6b')})}
 let _excludedChannels=[];
 function renderExcluded(discovered,excluded){_excludedChannels=excluded||[];const c=document.getElementById('excludedChannels');if(!c)return;const items=discovered.filter(ch=>excluded.includes(ch.slug));if(!items.length){c.innerHTML='';return}c.innerHTML=items.map(ch=>'<span class="filter-tag" style="background:#1a1a2e;color:#a0a0b0;cursor:pointer" onclick="readdChannel(\''+ch.slug.replace(/'/g,"\\'")+'\')">+ '+ch.name+'</span>').join('')}
 function removeChannel(slug){post('/api/channel/remove/'+slug,{}).catch(()=>{})}
@@ -2125,7 +2462,7 @@ def api_settings():
                 config[k] = float(data[k]) if k == "confidence" else int(data[k])
         if "model" in data:
             config["model"] = str(data["model"])
-        if "overlay" in data and data["overlay"] in ("none", "text", "graphic", "petfree", "paw", "censored"):
+        if "overlay" in data and data["overlay"] in ("none", "text", "graphic", "petfree", "paw", "censored", "shield", "tvrating", "cleanstream", "lock", "filmstrip", "nocat", "poweredby", "eyeslash", "filtered", "nohorse", "nodog", "nopaw", "animalfree"):
             config["overlay"] = data["overlay"]
         if "censor_mode" in data and data["censor_mode"] in ("black", "blur", "fine_blur", "pixelate", "color_match"):
             config["censor_mode"] = data["censor_mode"]
@@ -2194,9 +2531,12 @@ def api_m3u_post():
 
 @app.route("/api/m3u/fetch", methods=["POST"])
 def api_m3u_fetch():
+    global _m3u_refetch_needed
     with m3u_lock:
         if m3u_state["fetching"]:
-            return jsonify({"ok": False, "error": "Already fetching"}), 409
+            _m3u_refetch_needed = True
+            print("[m3u] fetch already running, queued re-fetch", flush=True)
+            return jsonify({"ok": True, "queued": True})
     threading.Thread(target=fetch_m3u, daemon=True).start()
     return jsonify({"ok": True})
 
