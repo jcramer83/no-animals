@@ -1,0 +1,18 @@
+services:
+  noanimals:
+    build: .
+    ports:
+      - "8080:8080"
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "video"
+      - "render"
+    volumes:
+      - noanimals-data:/app/data
+      - noanimals-models:/app/models
+    restart: unless-stopped
+
+volumes:
+  noanimals-data:
+  noanimals-models:
