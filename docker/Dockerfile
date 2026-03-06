@@ -33,6 +33,9 @@ COPY export_model.py stream_animals_v3.py censor_animals.py ./
 # Pre-export YOLOv8m to OpenVINO format so it's ready at first boot
 RUN python export_model.py --model yolov8s.pt
 
+# Unraid icon
+LABEL net.unraid.docker.icon="https://raw.githubusercontent.com/jcramer83/no-animals/master/docker/icon.png"
+
 EXPOSE 8080
 
 CMD ["python", "stream_animals_v3.py"]
