@@ -2,6 +2,7 @@ FROM python:3.11-slim-bookworm
 
 # Prevent interactive prompts during package install
 ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
 
 # Enable non-free-firmware repo for Intel GPU drivers
 RUN sed -i 's/Components: main/Components: main contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources
