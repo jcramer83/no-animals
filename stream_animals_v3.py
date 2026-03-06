@@ -28,7 +28,7 @@ from datetime import datetime
 import numpy as np
 import cv2
 from pathlib import Path
-from flask import Flask, Response, request, jsonify, send_from_directory, redirect
+from flask import Flask, Response, request, jsonify, send_from_directory
 from PIL import Image, ImageDraw, ImageFont
 
 # ---------------------------------------------------------------------------
@@ -2873,14 +2873,9 @@ def _proxy_vod_direct(movie):
 @app.route("/movie/<user>/<password>/<stream_id>")
 @app.route("/movie/<user>/<password>/<stream_id>.<ext>")
 def xc_vod_stream(user, password, stream_id, ext="mkv"):
-    """Xtream Codes VOD stream — redirect to HLS censoring pipeline for seekable playback."""
-    with vod_lock:
-        movie = vod_catalog.get(stream_id)
-    if not movie:
-        return "Unknown movie", 404
-
-    print(f"[vod] {request.remote_addr} -> '{movie['name']}' (xui_id={stream_id}), redirecting to HLS pipeline", flush=True)
-    return redirect(f"/vod/{stream_id}/movie.m3u8")
+    """Xtream Codes VOD stream — proxy to HLS censoring pipeline for seekable playback."""
+    print(f"[vod] {request.remote_addr} -> XC movie request (xui_id={stream_id}), proxying to HLS pipeline", flush=True)
+    return vod_file(stream_id, "movie.m3u8")
 
 
 @app.route("/movie/<user>/<password>/<stream_id>/<path:extra>")
