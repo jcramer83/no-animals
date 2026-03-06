@@ -208,6 +208,7 @@ def slugify(name):
 
 def probe_stream(url):
     """Get source fps, audio presence, video dimensions, and duration."""
+    print(f"[probe] probing URL: {url[:120]}...", flush=True)
     cmd = [FFPROBE, "-v", "quiet", "-probesize", "5000000", "-analyzeduration", "5000000",
            "-print_format", "json", "-show_streams", "-show_format", url]
     try:
@@ -232,6 +233,13 @@ def probe_stream(url):
                 "duration": duration, "eng_audio_idx": eng_audio_idx}
     except Exception as e:
         print(f"[probe] failed: {e}", flush=True)
+        try:
+            stderr_out = r.stderr[:500] if r.stderr else "(no stderr)"
+            stdout_out = r.stdout[:500] if r.stdout else "(no stdout)"
+            print(f"[probe] ffprobe returncode={r.returncode} stderr={stderr_out}", flush=True)
+            print(f"[probe] ffprobe stdout={stdout_out}", flush=True)
+        except Exception:
+            pass
         return None
 
 
