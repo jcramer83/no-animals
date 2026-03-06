@@ -2112,10 +2112,10 @@ No channels discovered yet. Configure M3U source below and click Fetch Now.
 <div class="setting-desc">Frames to average box position over. Higher = steadier boxes, slower to react.</div>
 <div class="row"><label>YOLO Model</label><select id="model">
 <option value="yolov8n_openvino_model">yolov8n (fast)</option>
-<option value="yolov8s_openvino_model">yolov8s (balanced)</option>
-<option value="yolov8s_openvino_model">yolov8m</option>
-<option value="yolov8l_openvino_model">yolov8l</option>
-<option value="yolov8s_openvino_model" selected>yolov8m (balanced)</option>
+<option value="yolov8s_openvino_model" selected>yolov8s (balanced)</option>
+<option value="yolov8m_openvino_model">yolov8m (accurate)</option>
+<option value="yolov8l_openvino_model">yolov8l (heavy)</option>
+<option value="yolov8x_openvino_model">yolov8x (max accuracy)</option>
 </select></div>
 <div class="setting-desc">YOLOv8 model size (OpenVINO). Larger = more accurate but uses more CPU. Export with export_model.py first.</div>
 <div class="row"><label>Censor Style</label><select id="censorMode">
