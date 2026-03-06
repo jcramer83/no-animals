@@ -588,7 +588,7 @@ class StreamInstance:
         src_w, src_h = probe.get("width", 0), probe.get("height", 0)
         if probe.get("duration", 0) > 0:
             self.total_duration = probe["duration"]
-        target_fps = max(15.0, min(probe["fps"], 60.0))
+        target_fps = max(15.0, min(probe["fps"], 30.0))
         self.target_fps = target_fps
         print(f"[{tag}] probe: src={src_w}x{src_h} fps={probe['fps']:.1f} audio={has_audio} dur={self.total_duration:.0f}s out={W}x{H}@{target_fps:.0f} hwaccel={hwaccel}", flush=True)
 
@@ -1016,7 +1016,7 @@ class StreamInstance:
             return
         has_audio = probe["has_audio"]
         src_w, src_h = probe.get("width", 0), probe.get("height", 0)
-        target_fps = max(15.0, min(probe["fps"], 60.0))
+        target_fps = max(15.0, min(probe["fps"], 30.0))
         self.target_fps = target_fps
         print(f"[{tag}] probe: src={src_w}x{src_h} fps={probe['fps']:.1f} audio={has_audio} out={W}x{H}@{target_fps:.0f} hwaccel={hwaccel}", flush=True)
 
