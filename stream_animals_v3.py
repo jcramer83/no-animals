@@ -365,6 +365,7 @@ _default_config = {
     "smooth_window": 5,
     "overlay": "text",
     "censor_mode": "pixelate",
+    "detect_every": 2,
     "channel_filters": ["hallmark"],
     "excluded_channels": [],
 }
@@ -754,8 +755,8 @@ class StreamInstance:
         animal_counts = {}
         fps_clock = time.perf_counter()
         start_time = time.time()
-        DETECT_EVERY = 2
         cached_boxes = []
+        fps_report_interval = int(FPS)
 
         with self.stats_lock:
             self.stats["status"] = "running"
@@ -790,6 +791,7 @@ class StreamInstance:
                 smooth = config["smooth_window"]
                 overlay_mode = config["overlay"]
                 censor_mode = config["censor_mode"]
+                detect_every = max(int(config.get("detect_every", 2)), 1)
 
             if new_model != cur_model:
                 cur_model = new_model
@@ -798,7 +800,7 @@ class StreamInstance:
             tracker.persist = persist
             tracker.smooth = smooth
 
-            if frame_count % DETECT_EVERY == 0:
+            if frame_count % detect_every == 0:
                 results = model.predict(frame, conf=conf, verbose=False,
                                         classes=list(ANIMAL_CLASS_IDS),
                                         imgsz=480)
@@ -883,9 +885,9 @@ class StreamInstance:
                 break
 
             frame_count += 1
-            if frame_count % 30 == 0:
+            if frame_count % fps_report_interval == 0:
                 now = time.perf_counter()
-                cur_fps = round(30 / max(now - fps_clock, 0.001), 1)
+                cur_fps = round(fps_report_interval / max(now - fps_clock, 0.001), 1)
                 try:
                     _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
                     self.last_frame_jpeg = jpeg.tobytes()
@@ -1145,8 +1147,8 @@ class StreamInstance:
         animal_counts = {}
         fps_clock = time.perf_counter()
         start_time = time.time()
-        DETECT_EVERY = 2
         cached_boxes = []
+        fps_report_interval = int(FPS)
 
         with self.stats_lock:
             self.stats["status"] = "running"
@@ -1183,6 +1185,7 @@ class StreamInstance:
                 smooth = config["smooth_window"]
                 overlay_mode = config["overlay"]
                 censor_mode = config["censor_mode"]
+                detect_every = max(int(config.get("detect_every", 2)), 1)
 
             if new_model != cur_model:
                 cur_model = new_model
@@ -1191,7 +1194,7 @@ class StreamInstance:
             tracker.persist = persist
             tracker.smooth = smooth
 
-            if frame_count % DETECT_EVERY == 0:
+            if frame_count % detect_every == 0:
                 results = model.predict(frame, conf=conf, verbose=False,
                                         classes=list(ANIMAL_CLASS_IDS),
                                         imgsz=480)
@@ -1275,9 +1278,9 @@ class StreamInstance:
                 break
 
             frame_count += 1
-            if frame_count % 30 == 0:
+            if frame_count % fps_report_interval == 0:
                 now = time.perf_counter()
-                cur_fps = round(30 / max(now - fps_clock, 0.001), 1)
+                cur_fps = round(fps_report_interval / max(now - fps_clock, 0.001), 1)
                 try:
                     _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
                     self.last_frame_jpeg = jpeg.tobytes()
@@ -2119,6 +2122,8 @@ No channels discovered yet. Configure M3U source below and click Fetch Now.
 <div class="setting-desc">Frames to keep censoring after detection is lost. Prevents flicker.</div>
 <div class="row"><label>Smooth Window</label><input type="range" id="smooth" min="1" max="15" step="1" value="5"><span class="val" id="smoothVal">5</span></div>
 <div class="setting-desc">Frames to average box position over. Higher = steadier boxes, slower to react.</div>
+<div class="row"><label>Detect Every N</label><input type="range" id="detectEvery" min="1" max="10" step="1" value="2"><span class="val" id="detectEveryVal">2</span></div>
+<div class="setting-desc">Run YOLO every Nth frame. Higher = less CPU, but slower to detect new animals. BoxTracker fills gaps.</div>
 <div class="row"><label>YOLO Model</label><select id="model">
 <option value="yolov8n_openvino_model">yolov8n (fast)</option>
 <option value="yolov8s_openvino_model" selected>yolov8s (balanced)</option>
@@ -2173,9 +2178,9 @@ No channels discovered yet. Configure M3U source below and click Fetch Now.
 let dt=null;
 function copyText(text,btn){if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(text)}else{const ta=document.createElement('textarea');ta.value=text;ta.style.cssText='position:fixed;left:-9999px';document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta)}if(btn){const orig=btn.textContent;btn.textContent='Copied!';setTimeout(()=>btn.textContent=orig,1500)}}
 function post(u,b){return fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})}
-function sendSettings(){post('/api/settings',{confidence:parseFloat(document.getElementById('confidence').value),padding:parseInt(document.getElementById('padding').value),persist_frames:parseInt(document.getElementById('persist').value),smooth_window:parseInt(document.getElementById('smooth').value),model:document.getElementById('model').value,overlay:document.getElementById('overlay').value,censor_mode:document.getElementById('censorMode').value})}
+function sendSettings(){post('/api/settings',{confidence:parseFloat(document.getElementById('confidence').value),padding:parseInt(document.getElementById('padding').value),persist_frames:parseInt(document.getElementById('persist').value),smooth_window:parseInt(document.getElementById('smooth').value),detect_every:parseInt(document.getElementById('detectEvery').value),model:document.getElementById('model').value,overlay:document.getElementById('overlay').value,censor_mode:document.getElementById('censorMode').value})}
 function ds(){clearTimeout(dt);dt=setTimeout(sendSettings,500)}
-['confidence','padding','persist','smooth'].forEach(id=>{const e=document.getElementById(id),v=document.getElementById(id+'Val');e.addEventListener('input',()=>{v.textContent=id==='confidence'?parseFloat(e.value).toFixed(2):e.value;ds()})});
+['confidence','padding','persist','smooth','detectEvery'].forEach(id=>{const e=document.getElementById(id),v=document.getElementById(id+'Val');e.addEventListener('input',()=>{v.textContent=id==='confidence'?parseFloat(e.value).toFixed(2):e.value;ds()})});
 document.getElementById('model').addEventListener('change',sendSettings);
 document.getElementById('censorMode').addEventListener('change',sendSettings);
 document.getElementById('overlay').addEventListener('change',function(){sendSettings();updateOverlayPreview()});
@@ -2308,7 +2313,7 @@ function renderVodCards(vodStats){
 function syncSelect(id,val){const el=document.getElementById(id);if(el&&val!=null&&el.value!==String(val))el.value=val}
 function syncRange(id,val){const el=document.getElementById(id);if(el&&val!=null&&String(el.value)!==String(val)){el.value=val;const v=document.getElementById(id+'Val');if(v)v.textContent=id==='confidence'?parseFloat(val).toFixed(2):val}}
 let _resolution='-';
-function poll(){fetch('/api/stats').then(r=>r.json()).then(d=>{const vodData=d._vod||{};delete d._vod;const discovered=d._discovered||[];delete d._discovered;if(d._config){syncSelect('overlay',d._config.overlay);syncSelect('censorMode',d._config.censor_mode);syncSelect('model',d._config.model);syncRange('confidence',d._config.confidence);syncRange('padding',d._config.padding);syncRange('persist',d._config.persist_frames);syncRange('smooth',d._config.smooth_window);if(d._config.resolution)_resolution=d._config.resolution;if(d._config.channel_filters)renderFilters(d._config.channel_filters);renderExcluded(discovered,d._config.excluded_channels||[]);updateOverlayPreview();delete d._config}renderStreamCards(d);renderVodCards(vodData)}).catch(()=>{})}
+function poll(){fetch('/api/stats').then(r=>r.json()).then(d=>{const vodData=d._vod||{};delete d._vod;const discovered=d._discovered||[];delete d._discovered;if(d._config){syncSelect('overlay',d._config.overlay);syncSelect('censorMode',d._config.censor_mode);syncSelect('model',d._config.model);syncRange('confidence',d._config.confidence);syncRange('padding',d._config.padding);syncRange('persist',d._config.persist_frames);syncRange('smooth',d._config.smooth_window);syncRange('detectEvery',d._config.detect_every);if(d._config.resolution)_resolution=d._config.resolution;if(d._config.channel_filters)renderFilters(d._config.channel_filters);renderExcluded(discovered,d._config.excluded_channels||[]);updateOverlayPreview();delete d._config}renderStreamCards(d);renderVodCards(vodData)}).catch(()=>{})}
 setInterval(poll,2000);poll();
 
 function fmtDate(iso){if(!iso)return'Never';const d=new Date(iso);return d.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'})+' '+d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'})}
@@ -2471,7 +2476,7 @@ def api_settings():
     data = request.get_json(force=True)
     filters_changed = False
     with config_lock:
-        for k in ("confidence", "padding", "persist_frames", "smooth_window"):
+        for k in ("confidence", "padding", "persist_frames", "smooth_window", "detect_every"):
             if k in data:
                 config[k] = float(data[k]) if k == "confidence" else int(data[k])
         if "model" in data:
