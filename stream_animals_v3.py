@@ -764,6 +764,8 @@ class StreamInstance:
         start_time = time.time()
         cached_boxes = []
         fps_report_interval = max(int(target_fps), 1)
+        frame_interval = 1.0 / target_fps
+        next_process_time = time.perf_counter()
 
         with self.stats_lock:
             self.stats["status"] = "running"
@@ -787,6 +789,12 @@ class StreamInstance:
                         self.stats["last_error"] = "Decoder stream ended"
                         self.stats["status"] = "listening"
                 break
+
+            # Drop excess frames — drain TCP but only process at target FPS
+            now = time.perf_counter()
+            if now < next_process_time:
+                continue
+            next_process_time = now + frame_interval
 
             frame = np.frombuffer(frame_buf, dtype=np.uint8).reshape((H, W, 3)).copy()
 
@@ -1158,6 +1166,8 @@ class StreamInstance:
         start_time = time.time()
         cached_boxes = []
         fps_report_interval = max(int(target_fps), 1)
+        frame_interval = 1.0 / target_fps
+        next_process_time = time.perf_counter()
 
         with self.stats_lock:
             self.stats["status"] = "running"
@@ -1183,6 +1193,12 @@ class StreamInstance:
                         self.stats["last_error"] = "Decoder stream ended"
                         self.stats["status"] = "listening"
                 break
+
+            # Drop excess frames — drain TCP but only process at target FPS
+            now = time.perf_counter()
+            if now < next_process_time:
+                continue
+            next_process_time = now + frame_interval
 
             frame = np.frombuffer(frame_buf, dtype=np.uint8).reshape((H, W, 3)).copy()
 
