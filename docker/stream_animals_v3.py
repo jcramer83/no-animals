@@ -352,7 +352,7 @@ config_lock = threading.Lock()
 _default_config = {
     "confidence": 0.4,
     "padding": 30,
-    "model": "yolov8m_openvino_model",
+    "model": "yolov8s_openvino_model",
     "persist_frames": 2,
     "smooth_window": 5,
     "overlay": "text",
@@ -2113,9 +2113,9 @@ No channels discovered yet. Configure M3U source below and click Fetch Now.
 <div class="row"><label>YOLO Model</label><select id="model">
 <option value="yolov8n_openvino_model">yolov8n (fast)</option>
 <option value="yolov8s_openvino_model">yolov8s (balanced)</option>
-<option value="yolov8m_openvino_model">yolov8m</option>
+<option value="yolov8s_openvino_model">yolov8m</option>
 <option value="yolov8l_openvino_model">yolov8l</option>
-<option value="yolov8m_openvino_model" selected>yolov8m (balanced)</option>
+<option value="yolov8s_openvino_model" selected>yolov8m (balanced)</option>
 </select></div>
 <div class="setting-desc">YOLOv8 model size (OpenVINO). Larger = more accurate but uses more CPU. Export with export_model.py first.</div>
 <div class="row"><label>Censor Style</label><select id="censorMode">

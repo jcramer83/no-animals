@@ -31,7 +31,7 @@ COPY overlay_*.png ./
 COPY export_model.py stream_animals_v3.py censor_animals.py ./
 
 # Pre-export YOLOv8m to OpenVINO format so it's ready at first boot
-RUN python export_model.py --model yolov8m.pt
+RUN python export_model.py --model yolov8s.pt
 
 EXPOSE 8080
 
