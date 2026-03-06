@@ -757,6 +757,8 @@ class StreamInstance:
         start_time = time.time()
         cached_boxes = []
         fps_report_interval = int(FPS)
+        frame_interval = 1.0 / FPS
+        next_frame_time = time.perf_counter()
 
         with self.stats_lock:
             self.stats["status"] = "running"
@@ -780,6 +782,13 @@ class StreamInstance:
                         self.stats["last_error"] = "Decoder stream ended"
                         self.stats["status"] = "listening"
                 break
+
+            # Frame pacing — sleep if decoder is feeding faster than target FPS
+            now = time.perf_counter()
+            sleep_time = next_frame_time - now
+            if sleep_time > 0.001:
+                time.sleep(sleep_time)
+            next_frame_time = max(next_frame_time + frame_interval, time.perf_counter())
 
             frame = np.frombuffer(frame_buf, dtype=np.uint8).reshape((H, W, 3)).copy()
 
@@ -1149,6 +1158,8 @@ class StreamInstance:
         start_time = time.time()
         cached_boxes = []
         fps_report_interval = int(FPS)
+        frame_interval = 1.0 / FPS
+        next_frame_time = time.perf_counter()
 
         with self.stats_lock:
             self.stats["status"] = "running"
@@ -1174,6 +1185,13 @@ class StreamInstance:
                         self.stats["last_error"] = "Decoder stream ended"
                         self.stats["status"] = "listening"
                 break
+
+            # Frame pacing — sleep if decoder is feeding faster than target FPS
+            now = time.perf_counter()
+            sleep_time = next_frame_time - now
+            if sleep_time > 0.001:
+                time.sleep(sleep_time)
+            next_frame_time = max(next_frame_time + frame_interval, time.perf_counter())
 
             frame = np.frombuffer(frame_buf, dtype=np.uint8).reshape((H, W, 3)).copy()
 
