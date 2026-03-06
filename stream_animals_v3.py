@@ -764,6 +764,9 @@ class StreamInstance:
         start_time = time.time()
         cached_boxes = []
         fps_report_interval = max(int(target_fps), 1)
+        # Safety cap: drop frames above 60fps to prevent runaway VAAPI decode
+        max_fps_interval = 1.0 / 60.0
+        next_process_time = 0.0
 
         with self.stats_lock:
             self.stats["status"] = "running"
@@ -787,6 +790,12 @@ class StreamInstance:
                         self.stats["last_error"] = "Decoder stream ended"
                         self.stats["status"] = "listening"
                 break
+
+            # Drop frames above 60fps safety cap
+            now = time.perf_counter()
+            if now < next_process_time:
+                continue
+            next_process_time = now + max_fps_interval
 
             frame = np.frombuffer(frame_buf, dtype=np.uint8).reshape((H, W, 3)).copy()
 
@@ -1158,6 +1167,8 @@ class StreamInstance:
         start_time = time.time()
         cached_boxes = []
         fps_report_interval = max(int(target_fps), 1)
+        max_fps_interval = 1.0 / 60.0
+        next_process_time = 0.0
 
         with self.stats_lock:
             self.stats["status"] = "running"
@@ -1183,6 +1194,12 @@ class StreamInstance:
                         self.stats["last_error"] = "Decoder stream ended"
                         self.stats["status"] = "listening"
                 break
+
+            # Drop frames above 60fps safety cap
+            now = time.perf_counter()
+            if now < next_process_time:
+                continue
+            next_process_time = now + max_fps_interval
 
             frame = np.frombuffer(frame_buf, dtype=np.uint8).reshape((H, W, 3)).copy()
 
