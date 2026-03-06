@@ -351,7 +351,7 @@ def _build_decoder_vf(hwaccel, fps=None):
     """Return video filter string for decoder."""
     _fps = fps or FPS
     if hwaccel == "vaapi":
-        return f"fps={_fps:.2f},scale_vaapi=w={W}:h={H},hwdownload,format=nv12"
+        return f"scale_vaapi=w={W}:h={H},hwdownload,format=nv12,fps={_fps:.2f}"
     return f"fps={_fps:.2f},scale={W}:{H}"
 
 
