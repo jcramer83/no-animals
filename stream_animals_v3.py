@@ -763,16 +763,12 @@ class StreamInstance:
         fps_clock = time.perf_counter()
         start_time = time.time()
         cached_boxes = []
-        fps_report_interval = max(int(target_fps), 1)
-        # Safety cap: drop frames above 60fps to prevent runaway VAAPI decode
-        max_fps_interval = 1.0 / 60.0
-        next_process_time = 0.0
 
         with self.stats_lock:
             self.stats["status"] = "running"
             self.stats["last_error"] = ""
 
-        print(f"[{tag}] main loop started (target_fps={target_fps:.0f})", flush=True)
+        print(f"[{tag}] main loop started", flush=True)
 
         # -------------------------------------------------------------------
         # MAIN LOOP: recv -> detect -> draw -> send
@@ -790,12 +786,6 @@ class StreamInstance:
                         self.stats["last_error"] = "Decoder stream ended"
                         self.stats["status"] = "listening"
                 break
-
-            # Drop frames above 60fps safety cap
-            now = time.perf_counter()
-            if now < next_process_time:
-                continue
-            next_process_time = now + max_fps_interval
 
             frame = np.frombuffer(frame_buf, dtype=np.uint8).reshape((H, W, 3)).copy()
 
@@ -901,9 +891,9 @@ class StreamInstance:
                 break
 
             frame_count += 1
-            if frame_count % fps_report_interval == 0:
+            if frame_count % 30 == 0:
                 now = time.perf_counter()
-                cur_fps = round(fps_report_interval / max(now - fps_clock, 0.001), 1)
+                cur_fps = round(30 / max(now - fps_clock, 0.001), 1)
                 try:
                     _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
                     self.last_frame_jpeg = jpeg.tobytes()
@@ -1166,9 +1156,6 @@ class StreamInstance:
         fps_clock = time.perf_counter()
         start_time = time.time()
         cached_boxes = []
-        fps_report_interval = max(int(target_fps), 1)
-        max_fps_interval = 1.0 / 60.0
-        next_process_time = 0.0
 
         with self.stats_lock:
             self.stats["status"] = "running"
@@ -1176,7 +1163,7 @@ class StreamInstance:
 
         # Signal that pipeline is ready — Flask can start reading encoder stdout
         self.pipeline_ready.set()
-        print(f"[{tag}] stdout pipeline started (target_fps={target_fps:.0f})", flush=True)
+        print(f"[{tag}] stdout pipeline started", flush=True)
 
         # -------------------------------------------------------------------
         # MAIN LOOP: recv -> detect -> draw -> send
@@ -1194,12 +1181,6 @@ class StreamInstance:
                         self.stats["last_error"] = "Decoder stream ended"
                         self.stats["status"] = "listening"
                 break
-
-            # Drop frames above 60fps safety cap
-            now = time.perf_counter()
-            if now < next_process_time:
-                continue
-            next_process_time = now + max_fps_interval
 
             frame = np.frombuffer(frame_buf, dtype=np.uint8).reshape((H, W, 3)).copy()
 
@@ -1304,9 +1285,9 @@ class StreamInstance:
                 break
 
             frame_count += 1
-            if frame_count % fps_report_interval == 0:
+            if frame_count % 30 == 0:
                 now = time.perf_counter()
-                cur_fps = round(fps_report_interval / max(now - fps_clock, 0.001), 1)
+                cur_fps = round(30 / max(now - fps_clock, 0.001), 1)
                 try:
                     _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
                     self.last_frame_jpeg = jpeg.tobytes()
