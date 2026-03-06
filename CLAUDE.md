@@ -4,7 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Video animal censoring system that detects animals using YOLOv8 on CUDA and censors them with configurable styles. Three modes:
+Video animal censoring system that detects animals using YOLOv8 and censors them with configurable styles. Two platform variants:
+
+- **Windows** (root directory): CUDA/NVENC/NVDEC — requires NVIDIA GPU
+- **Docker/Linux** (`docker/` directory): OpenVINO/VAAPI — runs on Intel iGPU, falls back to CPU
+
+Three modes on both platforms:
 
 - **Batch processing** (`censor_animals.py`): Process video files offline
 - **Live streaming** (`stream_animals_v3.py`): Multi-stream IPTV processor — auto-discovers channels from an M3U playlist using configurable keyword filters (default: "hallmark"), each with an independent pipeline, auto-start/stop on client activity, web dashboard
@@ -12,6 +17,7 @@ Video animal censoring system that detects animals using YOLOv8 on CUDA and cens
 
 ## Running
 
+### Windows
 ```bash
 # Batch process a video file
 py -3 censor_animals.py "input.mkv"
@@ -26,24 +32,41 @@ py -3 stream_animals_v3.py
 
 Note: Use `py -3` on this Windows system, not `python`. FFmpeg must be on PATH or at the WinGet install path (`%LOCALAPPDATA%\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.0.1-full_build\bin`).
 
+### Docker
+```bash
+docker run -d --name noanimals \
+  -p 8080:8080 \
+  --device /dev/dri:/dev/dri \
+  --group-add video \
+  -v /path/to/data:/app/data \
+  -v /path/to/models:/app/models \
+  -e M3U_URL="https://..." \
+  ghcr.io/jcramer83/no-animals:latest
+```
+
+Image is built automatically by GitHub Actions on push to `docker/` or `.github/workflows/docker.yml`. Pushed to `ghcr.io/jcramer83/no-animals:latest`. Image bundles YOLOv8s (OpenVINO format). See `docker/README.md` for Unraid-specific setup.
+
 ## Architecture
 
 ### Batch Pipeline (`censor_animals.py`)
-Single-threaded: OpenCV reads frames → YOLO detect → draw black boxes → OpenCV write temp file → FFmpeg mux with original audio/subtitles using NVENC.
+Single-threaded: OpenCV reads frames → YOLO detect → draw black boxes → OpenCV write temp file → FFmpeg mux with original audio/subtitles. Windows uses NVENC; Docker uses VAAPI (or libx264 fallback).
 
 ### Live Streaming Pipeline (`stream_animals_v3.py`)
 
 Multi-stream architecture. Each discovered channel gets an independent `StreamInstance` with its own pipeline:
 
 ```
-HLS Source → [Decoder FFmpeg: NVDEC + scale_cuda + fps=30]
+HLS Source → [Decoder FFmpeg: hwaccel decode + scale + fps=30]
                     ↓ TCP:port+1 (raw BGR24 1920x1080)
-             [Python: YOLO FP16 @ 480px, every 2nd frame]
+             [Python: YOLO @ 480px, every 2nd frame]
                     ↓ TCP:port+2
              [Encoder FFmpeg: video TCP + audio TCP:port+0] → HLS segments
                     ↓
              [Flask :8080] → dashboard + /stream/<slug>/<slug>.m3u8
 ```
+
+**Windows**: NVDEC decode (`h264_cuvid`), `scale_cuda`, NVENC encode (`h264_nvenc`), YOLO FP16 on CUDA.
+**Docker**: VAAPI decode/encode (`h264_vaapi`, `scale_vaapi`), YOLO on OpenVINO CPU. Auto-detects VAAPI via `vainfo`; falls back to `libx264` software encode.
 
 Port allocation: live stream 0 = 19876-19878, stream 1 = 19886-19888, stream 2 = 19896-19898. VOD pipelines use 19976+ (`VOD_PORT_BASE`). Audio on port+0, decoder video on port+1, encoder video on port+2.
 
@@ -113,8 +136,8 @@ Five modes, all with rounded-corner masks (radius scales with box size):
 
 ### Overlay System
 
-Six options, pre-rendered as BGRA numpy arrays at module load (zero per-frame PIL cost):
-- **none**, **text** ("NoAnimals"), **graphic** (dog emoji + prohibition sign), **petfree** ("PET FREE TV" badge), **paw** (paw emoji + prohibition sign), **censored** (red stamp)
+18 options, pre-rendered as BGRA numpy arrays at module load (zero per-frame PIL cost):
+- **none**, **text** ("NoAnimals"), **graphic** (dog emoji + prohibition), **petfree** ("PET FREE TV" badge), **paw** (paw + prohibition), **censored** (red stamp), **shield** ("NA" monogram), **tvrating** ("TV-NA" badge), **cleanstream** ("CLEAN STREAM"), **lock** (padlock + checkmark), **filmstrip** (film frame + branding), **nocat** (cat + prohibition), **poweredby** ("Powered by NoAnimals"), **eyeslash** (eye with slash), **filtered** ("FILTERED" green stamp), **nohorse** (horse + prohibition), **nodog** (PNG overlay), **nopaw** (PNG overlay), **animalfree** (PNG overlay)
 
 Applied via `apply_overlay()` using alpha compositing. Live streams: bottom-left (16px margin, adjusted for `pad_y` letterbox). VOD: bottom-left, 180px from bottom edge to clear widescreen letterbox bars.
 
@@ -133,9 +156,17 @@ Applied via `apply_overlay()` using alpha compositing. Live streams: bottom-left
 
 ## System Dependencies
 
+### Windows
 - **FFmpeg 8.0.1** (full build with NVENC/NVDEC/cuvid): On PATH or at WinGet install path
 - **NVIDIA GPU with CUDA**: Required for YOLO inference, NVDEC decode, NVENC encode
 - **Python packages**: `ultralytics`, `opencv-python`, `numpy`, `flask`, `Pillow`, `pystray`
+
+### Docker
+- **Docker** with `/dev/dri` device passthrough and `video` group access
+- **Intel CPU with integrated graphics** (6th gen+) for VAAPI; falls back to CPU-only if unavailable
+- **Image includes**: FFmpeg, Intel VAAPI drivers, OpenVINO, CPU-only PyTorch, YOLOv8s (pre-exported to OpenVINO IR)
+- **Dockerfile**: `docker/Dockerfile` — builds from `python:3.11-slim-bookworm`, enables Debian `non-free-firmware` repo for `intel-media-va-driver-non-free`
+- **CI/CD**: `.github/workflows/docker.yml` — auto-builds on push to `docker/`, pushes to `ghcr.io/jcramer83/no-animals:latest`
 
 ## Known Constraints
 
@@ -152,7 +183,20 @@ Applied via `apply_overlay()` using alpha compositing. Live streams: bottom-left
 - **VOD cleanup race condition**: Delayed cleanup threads must check `_pipeline_gen` before deleting output directories. Without this, a cleanup from a previous pipeline run can delete segments from a newly restarted pipeline.
 - **VOD overlay positioning**: Must be at least 180px from the bottom edge to avoid landing on player-added letterbox bars for widescreen movies. Do NOT use simple bottom-left (16px margin) for VOD — causes letterboxing artifacts.
 
+### Docker-Specific Constraints
+- **`PYTHONUNBUFFERED=1`**: Required in Dockerfile for logs to appear in `docker logs`. Without it, Python buffers stdout and no pipeline output is visible.
+- **Debian Bookworm `libgl1`**: Use `libgl1`, NOT `libgl1-mesa-glx` — that package was removed in Bookworm.
+- **Non-free-firmware repo**: Must be enabled via `sed` on `/etc/apt/sources.list.d/debian.sources` before installing `intel-media-va-driver-non-free` and `intel-opencl-icd`.
+- **CPU-only PyTorch**: Dockerfile installs `torch torchvision --index-url https://download.pytorch.org/whl/cpu` BEFORE `pip install -r requirements.txt` to avoid pulling the ~2.5GB CUDA bundle.
+- **No `render` group on Unraid**: Unraid's kernel lacks the `render` group. Only use `--group-add video`, not `--group-add render`.
+- **OpenVINO model must exist**: The app crashes with `FileNotFoundError` if the configured model directory doesn't exist. The Dockerfile pre-exports `yolov8s` during build.
+- **Settings file overrides defaults**: `noanimals_settings.json` (persisted in data volume) overrides code defaults. If changing the default model, the old settings file must be deleted or the model changed via dashboard.
+- **No `half=True` in predict for OpenVINO**: OpenVINO uses the precision from export, not runtime FP16. Remove `half=True` from all `model.predict()` calls in Docker version.
+- **No Windows subprocess flags**: Remove `creationflags=subprocess.CREATE_NO_WINDOW|ABOVE_NORMAL_PRIORITY_CLASS` — Linux doesn't have these.
+- **Font paths**: Docker uses Liberation Sans / DejaVu Sans (`/usr/share/fonts/truetype/`), not Windows Segoe UI / Arial. Helper `_find_font()` abstracts this.
+
 ## Key Design Decisions
+- **Full file fork for Docker**: `docker/stream_animals_v3.py` and `docker/censor_animals.py` are independent copies of the Windows versions with ~41 targeted changes (FFmpeg commands, YOLO loading, fonts, subprocess flags, dashboard HTML). Changes to one platform do NOT propagate to the other.
 - **TCP sockets for inter-process video/audio**: Windows anonymous pipes have ~4KB OS buffers, too slow for ~6MB raw 1080p frames.
 - **Audio bypasses Python entirely**: Decoder FFmpeg sends PCM audio (48kHz, 2ch, s16le) directly to encoder FFmpeg via TCP:port+0.
 - **Encoder opens audio TCP (input 0) before video TCP (input 1)**: FFmpeg opens inputs sequentially and blocks.
