@@ -1,7 +1,10 @@
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
 # Prevent interactive prompts during package install
 ENV DEBIAN_FRONTEND=noninteractive
+
+# Enable non-free-firmware repo for Intel GPU drivers
+RUN sed -i 's/Components: main/Components: main contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources
 
 # Install Intel VAAPI drivers, FFmpeg, fonts, and OpenCV deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
