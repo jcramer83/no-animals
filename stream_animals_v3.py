@@ -215,8 +215,11 @@ def probe_stream(url):
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         info = json.loads(r.stdout)
         vs = next(s for s in info["streams"] if s["codec_type"] == "video")
-        num, den = vs["r_frame_rate"].split("/")
-        fps = int(num) / int(den)
+        # Prefer avg_frame_rate (actual content fps) over r_frame_rate
+        # (which reports field rate for interlaced, e.g. 59.94 instead of 29.97)
+        fps_str = vs.get("avg_frame_rate") or vs["r_frame_rate"]
+        num, den = fps_str.split("/")
+        fps = int(num) / max(int(den), 1)
         has_audio = any(s["codec_type"] == "audio" for s in info["streams"])
         src_w = int(vs.get("width", 0))
         src_h = int(vs.get("height", 0))
