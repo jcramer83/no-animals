@@ -3234,26 +3234,26 @@ if __name__ == "__main__":
 
     print("Animal Censor Stream Server v3 — Multi-Stream")
 
-    # Restore streams from saved channels, then refresh from M3U source
+    # Restore streams from saved channels so dashboard is usable immediately
     with m3u_lock:
         saved_channels = list(m3u_state["channels"])
     if saved_channels:
         print(f"[startup] restoring {len(saved_channels)} channel(s) from saved settings", flush=True)
         _sync_streams(saved_channels)
 
-    # Fetch M3U synchronously to refresh channel URLs (no-op if no URL configured)
-    fetch_m3u()
+    # Fetch M3U in background so web UI is available immediately
+    def _startup_fetch():
+        fetch_m3u()
+        with streams_lock:
+            if streams:
+                print(f"Discovered {len(streams)} channel(s):", flush=True)
+                for slug, inst in streams.items():
+                    print(f"  [{slug}] {inst.channel_name}", flush=True)
+        with vod_lock:
+            if vod_catalog:
+                print(f"VOD catalog: {len(vod_catalog)} movies", flush=True)
 
-    with streams_lock:
-        if streams:
-            print(f"Discovered {len(streams)} channel(s):")
-            for slug, inst in streams.items():
-                print(f"  [{slug}] {inst.channel_name} -> http://localhost:8080/stream/{slug}/{slug}.m3u8")
-        else:
-            print("No channels discovered yet. Configure M3U source in dashboard.")
-    with vod_lock:
-        if vod_catalog:
-            print(f"VOD catalog: {len(vod_catalog)} movies")
+    threading.Thread(target=_startup_fetch, daemon=True).start()
 
     print(f"Dashboard: http://localhost:8080")
     threading.Thread(target=m3u_refresh_loop, daemon=True).start()
