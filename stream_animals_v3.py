@@ -315,15 +315,16 @@ def drain_stderr(proc, log_path=None):
 # Encoder/Decoder command builders
 # ---------------------------------------------------------------------------
 
-def _build_encoder_codec_args(hwaccel):
+def _build_encoder_codec_args(hwaccel, fps=None):
     """Return FFmpeg encoder codec arguments for VAAPI or CPU."""
+    _fps = fps or FPS
     if hwaccel == "vaapi":
         return [
             "-vaapi_device", "/dev/dri/renderD128",
             "-vf", "format=nv12,hwupload",
             "-c:v", "h264_vaapi",
             "-b:v", "4M", "-maxrate", "6M", "-bufsize", "8M",
-            "-g", str(int(FPS * 2)),
+            "-g", str(int(_fps * 2)),
         ]
     else:
         return [
@@ -331,7 +332,7 @@ def _build_encoder_codec_args(hwaccel):
             "-pix_fmt", "yuv420p",
             "-preset", "fast",
             "-b:v", "4M", "-maxrate", "6M", "-bufsize", "8M",
-            "-g", str(int(FPS * 2)),
+            "-g", str(int(_fps * 2)),
         ]
 
 
@@ -343,11 +344,12 @@ def _build_decoder_hwaccel_args(hwaccel):
     return []
 
 
-def _build_decoder_vf(hwaccel):
+def _build_decoder_vf(hwaccel, fps=None):
     """Return video filter string for decoder."""
+    _fps = fps or FPS
     if hwaccel == "vaapi":
-        return f"fps={FPS:.2f},scale_vaapi=w={W}:h={H},hwdownload,format=nv12"
-    return f"fps={FPS:.2f},scale={W}:{H}"
+        return f"fps={_fps:.2f},scale_vaapi=w={W}:h={H},hwdownload,format=nv12"
+    return f"fps={_fps:.2f},scale={W}:{H}"
 
 
 # ---------------------------------------------------------------------------
@@ -583,7 +585,9 @@ class StreamInstance:
         src_w, src_h = probe.get("width", 0), probe.get("height", 0)
         if probe.get("duration", 0) > 0:
             self.total_duration = probe["duration"]
-        print(f"[{tag}] probe: src={src_w}x{src_h} fps={probe['fps']:.1f} audio={has_audio} dur={self.total_duration:.0f}s out={W}x{H}@{FPS} hwaccel={hwaccel}", flush=True)
+        target_fps = max(15.0, min(probe["fps"], 60.0))
+        self.target_fps = target_fps
+        print(f"[{tag}] probe: src={src_w}x{src_h} fps={probe['fps']:.1f} audio={has_audio} dur={self.total_duration:.0f}s out={W}x{H}@{target_fps:.0f} hwaccel={hwaccel}", flush=True)
 
         # --- Clean output dir (skip if keeping segments for seek) ---
         if not self.keep_segments:
@@ -609,7 +613,7 @@ class StreamInstance:
             enc_cmd += [
                 "-probesize", "32", "-analyzeduration", "0",
                 "-f", "rawvideo", "-pix_fmt", PIX, "-s", f"{W}x{H}",
-                "-r", f"{FPS:.2f}", "-thread_queue_size", "512",
+                "-r", f"{target_fps:.2f}", "-thread_queue_size", "512",
                 "-i", f"tcp://127.0.0.1:{self.v_out_port}?listen=1",
             ]
             enc_cmd += ["-map", "1:v", "-map", "0:a"]
@@ -617,11 +621,11 @@ class StreamInstance:
             enc_cmd += [
                 "-probesize", "32", "-analyzeduration", "0",
                 "-f", "rawvideo", "-pix_fmt", PIX, "-s", f"{W}x{H}",
-                "-r", f"{FPS:.2f}", "-thread_queue_size", "512",
+                "-r", f"{target_fps:.2f}", "-thread_queue_size", "512",
                 "-i", f"tcp://127.0.0.1:{self.v_out_port}?listen=1",
             ]
             enc_cmd += ["-map", "0:v"]
-        enc_cmd += _build_encoder_codec_args(hwaccel)
+        enc_cmd += _build_encoder_codec_args(hwaccel, target_fps)
         if has_audio:
             enc_cmd += ["-c:a", "aac", "-b:a", "128k"]
         # For VOD seek: offset encoder timestamps to match playlist position
@@ -671,7 +675,7 @@ class StreamInstance:
 
         # Build video filter chain — scale to output resolution
         self.pad_y = 0
-        vf = _build_decoder_vf(hwaccel)
+        vf = _build_decoder_vf(hwaccel, target_fps)
 
         dec_cmd += ["-i", self.stream_url]
         if self.is_vod:
@@ -756,15 +760,15 @@ class StreamInstance:
         fps_clock = time.perf_counter()
         start_time = time.time()
         cached_boxes = []
-        fps_report_interval = int(FPS)
-        frame_interval = 1.0 / FPS
+        fps_report_interval = max(int(target_fps), 1)
+        frame_interval = 1.0 / target_fps
         next_frame_time = time.perf_counter()
 
         with self.stats_lock:
             self.stats["status"] = "running"
             self.stats["last_error"] = ""
 
-        print(f"[{tag}] main loop started", flush=True)
+        print(f"[{tag}] main loop started (target_fps={target_fps:.0f})", flush=True)
 
         # -------------------------------------------------------------------
         # MAIN LOOP: recv -> detect -> draw -> send
@@ -1009,7 +1013,9 @@ class StreamInstance:
             return
         has_audio = probe["has_audio"]
         src_w, src_h = probe.get("width", 0), probe.get("height", 0)
-        print(f"[{tag}] probe: src={src_w}x{src_h} fps={probe['fps']:.1f} audio={has_audio} out={W}x{H}@{FPS} hwaccel={hwaccel}", flush=True)
+        target_fps = max(15.0, min(probe["fps"], 60.0))
+        self.target_fps = target_fps
+        print(f"[{tag}] probe: src={src_w}x{src_h} fps={probe['fps']:.1f} audio={has_audio} out={W}x{H}@{target_fps:.0f} hwaccel={hwaccel}", flush=True)
 
         self.stop_event.clear()
         self.pipeline_procs = []
@@ -1029,7 +1035,7 @@ class StreamInstance:
             enc_cmd += [
                 "-probesize", "32", "-analyzeduration", "0",
                 "-f", "rawvideo", "-pix_fmt", PIX, "-s", f"{W}x{H}",
-                "-r", f"{FPS:.2f}", "-thread_queue_size", "512",
+                "-r", f"{target_fps:.2f}", "-thread_queue_size", "512",
                 "-i", f"tcp://127.0.0.1:{self.v_out_port}?listen=1",
             ]
             enc_cmd += ["-map", "1:v", "-map", "0:a"]
@@ -1037,11 +1043,11 @@ class StreamInstance:
             enc_cmd += [
                 "-probesize", "32", "-analyzeduration", "0",
                 "-f", "rawvideo", "-pix_fmt", PIX, "-s", f"{W}x{H}",
-                "-r", f"{FPS:.2f}", "-thread_queue_size", "512",
+                "-r", f"{target_fps:.2f}", "-thread_queue_size", "512",
                 "-i", f"tcp://127.0.0.1:{self.v_out_port}?listen=1",
             ]
             enc_cmd += ["-map", "0:v"]
-        enc_cmd += _build_encoder_codec_args(hwaccel)
+        enc_cmd += _build_encoder_codec_args(hwaccel, target_fps)
         if has_audio:
             enc_cmd += ["-c:a", "aac", "-b:a", "128k"]
         enc_cmd += ["-f", "mpegts", "pipe:1"]
@@ -1069,7 +1075,7 @@ class StreamInstance:
 
         # Build video filter chain — scale to output resolution
         self.pad_y = 0
-        vf = _build_decoder_vf(hwaccel)
+        vf = _build_decoder_vf(hwaccel, target_fps)
 
         dec_cmd += ["-i", self.stream_url]
         if self.is_vod:
@@ -1157,8 +1163,8 @@ class StreamInstance:
         fps_clock = time.perf_counter()
         start_time = time.time()
         cached_boxes = []
-        fps_report_interval = int(FPS)
-        frame_interval = 1.0 / FPS
+        fps_report_interval = max(int(target_fps), 1)
+        frame_interval = 1.0 / target_fps
         next_frame_time = time.perf_counter()
 
         with self.stats_lock:
@@ -1167,7 +1173,7 @@ class StreamInstance:
 
         # Signal that pipeline is ready — Flask can start reading encoder stdout
         self.pipeline_ready.set()
-        print(f"[{tag}] stdout pipeline started", flush=True)
+        print(f"[{tag}] stdout pipeline started (target_fps={target_fps:.0f})", flush=True)
 
         # -------------------------------------------------------------------
         # MAIN LOOP: recv -> detect -> draw -> send
@@ -3109,7 +3115,7 @@ def vod_file(xui_id, filename):
             with inst.stats_lock:
                 st = inst.stats["status"]
                 frames = inst.stats["frames_processed"]
-            current_time = frames / FPS + inst.seek_offset
+            current_time = frames / getattr(inst, 'target_fps', FPS) + inst.seek_offset
 
             # Decide: wait (segment is close) or seek-restart (far ahead/behind)
             need_seek = False
