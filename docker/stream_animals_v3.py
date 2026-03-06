@@ -380,7 +380,7 @@ def _load_config():
 
 def _load_m3u_state():
     """Load saved M3U state (url, channels, last_fetched) from settings file."""
-    state = {"m3u_url": "https://hivecast.cc:8443/get.php?username=lucasmatt11980&password=ZqHMqBweKK&type=m3u_plus&output=mpegts", "channels": [], "all_channels": [], "last_fetched": None, "last_error": "", "fetching": False}
+    state = {"m3u_url": os.environ.get("M3U_URL", ""), "channels": [], "all_channels": [], "last_fetched": None, "last_error": "", "fetching": False}
     try:
         if SETTINGS_FILE.exists():
             with open(SETTINGS_FILE, "r") as f:
