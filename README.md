@@ -1,118 +1,99 @@
-![NoAnimals Banner](banner.png)
-
 # NoAnimals
 
-Real-time video animal censoring system. Detects animals using YOLOv8 on CUDA and censors them with configurable styles. Supports both batch file processing and live IPTV stream processing with a web dashboard.
+Real-time video animal censoring for IPTV streams, running on Linux with Intel iGPU hardware acceleration.
 
-## Features
+Uses **VAAPI** for FFmpeg encode/decode and **OpenVINO** for YOLO inference (CPU). Falls back to software encoding if no iGPU is available.
 
-- **Two processing modes**: Batch (offline file processing) and live (multi-stream IPTV with HLS output)
-- **4 censoring styles**: Black box, heavy blur, pixelate, or color-match fill — all with rounded corners
-- **6 overlay watermarks**: Text, graphic, "PET FREE TV" badge, paw, "CENSORED" stamp, or none
-- **Multi-stream**: Auto-discovers up to 3 channels from an M3U playlist, each with an independent pipeline
-- **Auto-start/stop**: Streams start on first client request and stop after 30 seconds of inactivity
-- **Web dashboard**: Configure settings, monitor streams, view per-species animal counts
-- **GPU-accelerated**: NVDEC decode, CUDA-based YOLO inference, NVENC encode
-- **System tray launcher**: Start/stop server and open dashboard from the tray icon
-
-## Requirements
-
-- Python 3.8+
-- NVIDIA GPU with CUDA support
-- FFmpeg with NVENC/NVDEC/cuvid support (must be on PATH or set `FFMPEG_PATH` env var)
-- Python packages:
-  ```
-  pip install ultralytics opencv-python numpy flask Pillow pystray
-  ```
-
-## Installation
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/yourusername/no-animals.git
-   cd no-animals
-   ```
-
-2. Install Python dependencies:
-   ```bash
-   pip install ultralytics opencv-python numpy flask Pillow pystray
-   ```
-
-3. Ensure FFmpeg (with NVENC/NVDEC) is on your PATH. If it's installed elsewhere, set the `FFMPEG_PATH` environment variable to the full path of the `ffmpeg` executable.
-
-4. A YOLO model (e.g. `yolov8n.pt`) will be downloaded automatically on first run, or you can place one in the project directory.
-
-## Usage
-
-### Batch Processing
-
-Process a video file, censoring all detected animals:
+## Quick Start
 
 ```bash
-python censor_animals.py "input.mkv"
-python censor_animals.py "input.mkv" --output censored.mkv --confidence 0.2 --padding 30
+docker run -d \
+  --name noanimals \
+  -p 8080:8080 \
+  --device /dev/dri:/dev/dri \
+  --group-add video \
+  -v /path/to/data:/app/data \
+  -v /path/to/models:/app/models \
+  ghcr.io/jcramer83/no-animals:latest
 ```
 
-### Live Streaming Server
+Dashboard: `http://localhost:8080`
 
-Start the multi-stream server (dashboard at http://localhost:5000):
+## Unraid Setup
+
+1. **Docker tab → Add Container**
+
+| Field | Value |
+|-------|-------|
+| Name | `noanimals` |
+| Repository | `ghcr.io/jcramer83/no-animals:latest` |
+| Network Type | `bridge` |
+| Extra Parameters | `--group-add video` |
+
+2. **Add the following mappings** (click "Add another Path, Port, Variable, Label or Device" for each):
+
+| Type | Container | Host |
+|------|-----------|------|
+| Port | `8080` | `8080` |
+| Device | `/dev/dri` | — |
+| Path | `/app/data` | `/mnt/user/appdata/noanimals/data` |
+| Path | `/app/models` | `/mnt/user/appdata/noanimals/models` |
+
+3. **Apply** and start the container.
+
+4. Open `http://<UNRAID-IP>:8080`, set your M3U URL, and start a stream.
+
+## Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `M3U_URL` | IPTV M3U playlist URL (can also be set in dashboard) | — |
+| `PYTHONUNBUFFERED` | Set to `1` for real-time log output | `1` |
+
+## Bundled Model
+
+The image includes **YOLOv8s** (OpenVINO format) — a good balance of speed and accuracy for CPU inference. Runs at 30+ fps on an Intel 13900K.
+
+Other models can be exported inside the container:
 
 ```bash
-# Via system tray launcher (Windows)
-# Double-click NoAnimals.bat or NoAnimals.vbs
-
-# Or start directly
-python stream_animals_v3.py
+docker exec noanimals python export_model.py --model yolov8n.pt   # fastest
+docker exec noanimals python export_model.py --model yolov8m.pt   # more accurate
+docker exec noanimals python export_model.py --model yolov8x.pt   # most accurate (may be too slow for real-time)
 ```
 
-On first run, configure your M3U playlist URL via the web dashboard. The server will discover Hallmark channels and create censored HLS streams.
+Then select the model from the dashboard dropdown.
 
-Point any video player at `http://localhost:5000/noanimals.m3u` to watch the censored streams.
+## IPTV App Setup (Xtream Codes)
 
-## API
+Connect any IPTV app (TiviMate, XCIPTV, Smarters, etc.) using Xtream Codes login:
 
-| Route | Method | Purpose |
-|-------|--------|---------|
-| `/` | GET | Web dashboard |
-| `/noanimals.m3u` | GET | M3U playlist of all censored streams |
-| `/stream/<slug>/<file>` | GET | HLS playlist/segments (auto-starts pipeline) |
-| `/api/start/<slug>` | POST | Start specific stream |
-| `/api/stop/<slug>` | POST | Stop specific stream |
-| `/api/settings` | POST | Update detection/censoring settings |
-| `/api/stats` | GET | Stats JSON for all streams |
-| `/api/overlay/preview` | GET | Base64 PNG previews for all overlay types |
-| `/api/m3u` | GET | M3U source config and discovered channels |
-| `/api/m3u` | POST | Update M3U URL |
-| `/api/m3u/fetch` | POST | Trigger M3U re-fetch |
-
-## Configuration
-
-All settings are configurable via the web dashboard and persisted to `noanimals_settings.json`:
-
-- **Confidence threshold**: Minimum detection confidence (0.0-1.0)
-- **Padding**: Extra pixels around detected animals
-- **Censor mode**: black, blur, pixelate, or color_match
-- **Overlay**: Watermark style
-- **YOLO model**: Swap between model sizes at runtime
+| Field | Value |
+|-------|-------|
+| Server | `http://<IP>:8080` |
+| Username | anything |
+| Password | anything |
 
 ## Architecture
 
-### Live Pipeline (per stream)
-
 ```
-HLS Source -> [Decoder FFmpeg: NVDEC + scale_cuda]
-                    | TCP (raw BGR24 1920x1080)
-             [Python: YOLO FP16 @ 480px, every 2nd frame]
-                    | TCP
-             [Encoder FFmpeg: video + audio] -> HLS segments
-                    |
-             [Flask :5000] -> dashboard + HLS
+HLS Source → [Decoder FFmpeg: VAAPI decode + scale]
+                  ↓ TCP (raw BGR24 1920x1080)
+           [Python: YOLOv8s OpenVINO @ 480px, every 2nd frame]
+                  ↓ TCP
+           [Encoder FFmpeg: VAAPI h264_vaapi encode] → HLS segments
+                  ↓
+           [Flask :8080] → Dashboard + /stream/<slug>/*.m3u8
 ```
 
-Audio bypasses Python entirely — decoder FFmpeg sends PCM audio directly to encoder FFmpeg via TCP.
+- **VAAPI** hardware encode/decode via Intel iGPU (`/dev/dri/renderD128`)
+- **OpenVINO** YOLO inference on CPU
+- Falls back to `libx264` software encode if no iGPU detected
 
-## Known Limitations
+## Requirements
 
-- **NVENC session limit**: Consumer NVIDIA GPUs allow max 2 simultaneous encode sessions. Only 2 streams can run concurrently without the NVENC session limit patch.
-- **Resolution**: Fixed at 1920x1080.
-- **Channel filter**: Only discovers channels with "hallmark" in the name (case-insensitive).
+- Docker
+- Intel CPU with integrated graphics (6th gen+) for VAAPI acceleration
+- `/dev/dri` device passthrough
+- `video` group access
+

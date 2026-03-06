@@ -4,12 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Video animal censoring system that detects animals using YOLOv8 and censors them with configurable styles. Two platform variants:
+Video animal censoring system that detects animals using YOLOv8 and censors them with configurable styles. Runs as a Docker container with OpenVINO/VAAPI on Intel iGPU, falls back to CPU.
 
-- **Windows** (root directory): CUDA/NVENC/NVDEC — requires NVIDIA GPU
-- **Docker/Linux** (`docker/` directory): OpenVINO/VAAPI — runs on Intel iGPU, falls back to CPU
-
-Three modes on both platforms:
+Three modes:
 
 - **Batch processing** (`censor_animals.py`): Process video files offline
 - **Live streaming** (`stream_animals_v3.py`): Multi-stream IPTV processor — auto-discovers channels from an M3U playlist using configurable keyword filters (default: "hallmark"), each with an independent pipeline, auto-start/stop on client activity, web dashboard
@@ -17,22 +14,6 @@ Three modes on both platforms:
 
 ## Running
 
-### Windows
-```bash
-# Batch process a video file
-py -3 censor_animals.py "input.mkv"
-py -3 censor_animals.py "input.mkv" --output censored.mkv --confidence 0.2 --padding 30
-
-# Start the live multi-stream server via tray launcher (recommended)
-# Double-click NoAnimals.bat or NoAnimals.vbs
-
-# Or start the server directly (dashboard on port 8080)
-py -3 stream_animals_v3.py
-```
-
-Note: Use `py -3` on this Windows system, not `python`. FFmpeg must be on PATH or at the WinGet install path (`%LOCALAPPDATA%\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.0.1-full_build\bin`).
-
-### Docker
 ```bash
 docker run -d --name noanimals \
   -p 8080:8080 \
@@ -44,12 +25,12 @@ docker run -d --name noanimals \
   ghcr.io/jcramer83/no-animals:latest
 ```
 
-Image is built automatically by GitHub Actions on push to `docker/` or `.github/workflows/docker.yml`. Pushed to `ghcr.io/jcramer83/no-animals:latest`. Image bundles YOLOv8s (OpenVINO format). See `docker/README.md` for Unraid-specific setup.
+Image is built automatically by GitHub Actions on push to master. Pushed to `ghcr.io/jcramer83/no-animals:latest`. Image bundles YOLOv8s (OpenVINO format). See `README.md` for Unraid-specific setup.
 
 ## Architecture
 
 ### Batch Pipeline (`censor_animals.py`)
-Single-threaded: OpenCV reads frames → YOLO detect → draw black boxes → OpenCV write temp file → FFmpeg mux with original audio/subtitles. Windows uses NVENC; Docker uses VAAPI (or libx264 fallback).
+Single-threaded: OpenCV reads frames → YOLO detect → draw black boxes → OpenCV write temp file → FFmpeg mux with original audio/subtitles. Uses VAAPI encode (or libx264 fallback).
 
 ### Live Streaming Pipeline (`stream_animals_v3.py`)
 
@@ -65,8 +46,7 @@ HLS Source → [Decoder FFmpeg: hwaccel decode + scale + fps=30]
              [Flask :8080] → dashboard + /stream/<slug>/<slug>.m3u8
 ```
 
-**Windows**: NVDEC decode (`h264_cuvid`), `scale_cuda`, NVENC encode (`h264_nvenc`), YOLO FP16 on CUDA.
-**Docker**: VAAPI decode/encode (`h264_vaapi`, `scale_vaapi`), YOLO on OpenVINO CPU. Auto-detects VAAPI via `vainfo`; falls back to `libx264` software encode.
+VAAPI decode/encode (`h264_vaapi`, `scale_vaapi`), YOLO on OpenVINO CPU. Auto-detects VAAPI via `vainfo`; falls back to `libx264` software encode.
 
 Port allocation: live stream 0 = 19876-19878, stream 1 = 19886-19888, stream 2 = 19896-19898. VOD pipelines use 19976+ (`VOD_PORT_BASE`). Audio on port+0, decoder video on port+1, encoder video on port+2.
 
@@ -76,7 +56,7 @@ Same `StreamInstance` class with `is_vod=True`. Key differences from live:
 - **HLS flags**: `hls_list_size=0` + `independent_segments` (keeps all segments, no rolling window)
 - **Synthetic m3u8**: `_serve_synthetic_m3u8()` generates a full-length playlist listing ALL segments (based on `total_duration` from probe) so IPTV apps show a complete seek bar. Includes `#EXT-X-DISCONTINUITY` tags at seek boundaries.
 - **Seeking**: `seek_restart()` kills the current pipeline and restarts with `-ss {offset}` on the decoder and `-output_ts_offset {offset}` on the encoder so PTS timestamps remain continuous. Thread-safe via `_seek_lock`. Probe results are cached (`_cached_probe`) to save ~10s on restarts.
-- **No hardcoded decoder**: Omits `-c:v h264_cuvid` to auto-detect codec (movies may be H.265/HEVC)
+- **No hardcoded decoder**: Omits hardcoded codec to auto-detect (movies may be H.265/HEVC)
 - **No letterboxing**: Movies are scaled directly to `{W}x{H}` regardless of source aspect ratio
 - **Overlay positioned bottom-left with margin**: VOD overlay is at (16, H-180-overlay_height) — 180px from the bottom edge to clear letterbox bars on widescreen movies (2.39:1 bars ≈ 138px). Live streams use bottom-left adjusted for `pad_y`.
 - **English audio track**: VOD decoder selects the English audio track (`-map 0:a:{eng_idx}`) based on language tags from probe, falling back to first track. Live streams always use first audio track.
@@ -85,10 +65,6 @@ Same `StreamInstance` class with `is_vod=True`. Key differences from live:
 - **Cleanup with generation check**: 5-min delayed cleanup after completion, but checks `_pipeline_gen` counter before deleting — if the pipeline was restarted (e.g. resume), cleanup is cancelled.
 - **Auto-restart on resume**: When an IPTV app requests an m3u8 for a VOD whose pipeline is in "listening"/"stopped"/"error" status, the `vod_file()` handler auto-restarts the pipeline (protected by `_seek_lock` to avoid racing with seeks).
 - **Segment streaming**: Segment responses use a Flask generator that waits up to 60s for the segment file to appear, keeping the HTTP connection alive during seek delays
-
-### Launch Chain
-
-`NoAnimals.bat` (or `.vbs`) → `noanimals_tray.pyw` (system tray icon with Start/Stop/Dashboard menu) → `stream_animals_v3.py` (subprocess with `CREATE_NO_WINDOW`). The `.bat` relaunches itself minimized to avoid a console popup. The `.vbs` is a fully silent alternative.
 
 ### Key Classes
 - `StreamInstance`: Per-stream state (ports, stats, stop_event, pipeline_procs, client tracking). Methods: `start()`, `stop()`, `run_pipeline()`, `run_pipeline_stdout()`, `seek_restart()`, `start_stdout()`, `touch_client()`. Flags: `is_vod`, `completed`, `xui_id`. Also stores `last_frame_jpeg` (latest processed frame as JPEG bytes for dashboard preview). `_pipeline_gen` counter tracks pipeline restarts for safe delayed cleanup.
@@ -103,7 +79,7 @@ Same `StreamInstance` class with `is_vod=True`. Key differences from live:
 
 ### M3U Parsing (`fetch_m3u`) and Channel Filtering (`_apply_filters`)
 
-Reads the entire hivecast M3U playlist (same URL for live + VOD):
+Reads the entire M3U playlist (same URL for live + VOD):
 - **Live channels**: ALL non-VOD entries are cached in `m3u_state["all_channels"]` (~6700 entries) with pre-computed `_match_text` (lowercase concat of tvg-name, tvg-id, group-title). `_apply_filters()` then filters this cache by `channel_filters` keywords — runs in-memory, instant. Channels in `excluded_channels` config are filtered out by `_sync_streams()`.
 - **VOD movies**: Identified by `xui-id` attribute + URL ending in `#.mkv`/`#.mp4`/`#.avi`. Checked first in parsing loop (with `continue`) so VOD entries don't pollute the live channel cache. TV show episodes (matching `S\d+E\d+` in name) are filtered out. URL fragment (`#.ext`) stripped before storage. Groups keep their `│` prefix (e.g. `│ Thriller`).
 - Fetched synchronously on boot, then every 3 days or on manual "Fetch Now". Filter keyword changes do NOT trigger a re-fetch — they re-filter the cached `all_channels` instantly via `_apply_filters()`. If the cache is empty (app just booted, first fetch still running), the frontend falls back to triggering a full fetch.
@@ -151,39 +127,28 @@ Applied via `apply_overlay()` using alpha compositing. Live streams: bottom-left
 ### Animal Detection & Counting
 
 - `ANIMAL_CLASS_IDS`: COCO classes 14-23 (bird, cat, dog, horse, sheep, cow, elephant, bear, zebra, giraffe)
-- Runs YOLO every 2nd frame (`DETECT_EVERY=2`) with FP16, `imgsz=480`
+- Runs YOLO every 2nd frame (`DETECT_EVERY=2`), `imgsz=480`
 - Unique instance counting via BoxTracker track IDs, per-species counts in dashboard
 
 ## System Dependencies
 
-### Windows
-- **FFmpeg 8.0.1** (full build with NVENC/NVDEC/cuvid): On PATH or at WinGet install path
-- **NVIDIA GPU with CUDA**: Required for YOLO inference, NVDEC decode, NVENC encode
-- **Python packages**: `ultralytics`, `opencv-python`, `numpy`, `flask`, `Pillow`, `pystray`
-
-### Docker
 - **Docker** with `/dev/dri` device passthrough and `video` group access
 - **Intel CPU with integrated graphics** (6th gen+) for VAAPI; falls back to CPU-only if unavailable
 - **Image includes**: FFmpeg, Intel VAAPI drivers, OpenVINO, CPU-only PyTorch, YOLOv8s (pre-exported to OpenVINO IR)
-- **Dockerfile**: `docker/Dockerfile` — builds from `python:3.11-slim-bookworm`, enables Debian `non-free-firmware` repo for `intel-media-va-driver-non-free`
-- **CI/CD**: `.github/workflows/docker.yml` — auto-builds on push to `docker/`, pushes to `ghcr.io/jcramer83/no-animals:latest`
+- **Dockerfile**: Builds from `python:3.11-slim-bookworm`, enables Debian `non-free-firmware` repo for `intel-media-va-driver-non-free`
+- **CI/CD**: `.github/workflows/docker.yml` — auto-builds on push to master, pushes to `ghcr.io/jcramer83/no-animals:latest`
 
 ## Known Constraints
 
-- **NVENC session limit**: Consumer GPUs cap at 2 simultaneous encode sessions. `MAX_STREAMS = 10` + `MAX_VOD_PIPELINES = 1` but total concurrent encodes limited by GPU.
-- **FFmpeg 8.0.1 quirks**: `-live_start_index` does not exist. Avoid it.
-- **YOLO `model.half()`**: Crashes silently. Use `half=True` in `model.predict()` instead.
-- **`-hwaccel_output_format cuda`**: Required with `scale_cuda` to keep frames on GPU.
+- **FFmpeg quirks**: `-live_start_index` does not exist in FFmpeg 8.0.1. Avoid it.
 - **Dashboard HTML is embedded** in `stream_animals_v3.py` as `DASHBOARD_HTML` string. Changes require server restart.
 - **Resolution fixed at compile time**: `W, H = 1920, 1080` is a module-level constant.
-- **VOD codec auto-detect**: VOD omits `-c:v h264_cuvid` so FFmpeg auto-selects the right cuvid decoder. Live streams hardcode h264_cuvid.
+- **VOD codec auto-detect**: VOD omits hardcoded decoder so FFmpeg auto-selects the right decoder. Live streams hardcode h264.
 - **VOD seek latency**: Seeking restarts the full pipeline (~12-22s) because the remote source must be re-opened with `-ss`. Probe caching helps (~10s saved).
 - **VOD seek decoder flags**: Do NOT add `-analyzeduration 0`, `-probesize 500000`, or `-fflags +fastseek+nobuffer` to the decoder for seeks — causes zero-frame output. Only `-ss` before `-i` is needed.
 - **VOD PTS continuity**: After seek, encoder must use `-output_ts_offset {seek_time}` so PTS timestamps match the synthetic playlist positions. Without this, players see a black screen after seeking.
 - **VOD cleanup race condition**: Delayed cleanup threads must check `_pipeline_gen` before deleting output directories. Without this, a cleanup from a previous pipeline run can delete segments from a newly restarted pipeline.
 - **VOD overlay positioning**: Must be at least 180px from the bottom edge to avoid landing on player-added letterbox bars for widescreen movies. Do NOT use simple bottom-left (16px margin) for VOD — causes letterboxing artifacts.
-
-### Docker-Specific Constraints
 - **`PYTHONUNBUFFERED=1`**: Required in Dockerfile for logs to appear in `docker logs`. Without it, Python buffers stdout and no pipeline output is visible.
 - **Debian Bookworm `libgl1`**: Use `libgl1`, NOT `libgl1-mesa-glx` — that package was removed in Bookworm.
 - **Non-free-firmware repo**: Must be enabled via `sed` on `/etc/apt/sources.list.d/debian.sources` before installing `intel-media-va-driver-non-free` and `intel-opencl-icd`.
@@ -191,17 +156,14 @@ Applied via `apply_overlay()` using alpha compositing. Live streams: bottom-left
 - **No `render` group on Unraid**: Unraid's kernel lacks the `render` group. Only use `--group-add video`, not `--group-add render`.
 - **OpenVINO model must exist**: The app crashes with `FileNotFoundError` if the configured model directory doesn't exist. The Dockerfile pre-exports `yolov8s` during build.
 - **Settings file overrides defaults**: `noanimals_settings.json` (persisted in data volume) overrides code defaults. If changing the default model, the old settings file must be deleted or the model changed via dashboard.
-- **No `half=True` in predict for OpenVINO**: OpenVINO uses the precision from export, not runtime FP16. Remove `half=True` from all `model.predict()` calls in Docker version.
-- **No Windows subprocess flags**: Remove `creationflags=subprocess.CREATE_NO_WINDOW|ABOVE_NORMAL_PRIORITY_CLASS` — Linux doesn't have these.
-- **Font paths**: Docker uses Liberation Sans / DejaVu Sans (`/usr/share/fonts/truetype/`), not Windows Segoe UI / Arial. Helper `_find_font()` abstracts this.
+- **No `half=True` in predict for OpenVINO**: OpenVINO uses the precision from export, not runtime FP16. Remove `half=True` from all `model.predict()` calls.
+- **Font paths**: Uses Liberation Sans / DejaVu Sans (`/usr/share/fonts/truetype/`). Helper `_find_font()` abstracts this.
 
 ## Key Design Decisions
-- **Full file fork for Docker**: `docker/stream_animals_v3.py` and `docker/censor_animals.py` are independent copies of the Windows versions with ~41 targeted changes (FFmpeg commands, YOLO loading, fonts, subprocess flags, dashboard HTML). Changes to one platform do NOT propagate to the other.
-- **TCP sockets for inter-process video/audio**: Windows anonymous pipes have ~4KB OS buffers, too slow for ~6MB raw 1080p frames.
+- **TCP sockets for inter-process video/audio**: Pipes have small OS buffers, too slow for ~6MB raw 1080p frames.
 - **Audio bypasses Python entirely**: Decoder FFmpeg sends PCM audio (48kHz, 2ch, s16le) directly to encoder FFmpeg via TCP:port+0.
 - **Encoder opens audio TCP (input 0) before video TCP (input 1)**: FFmpeg opens inputs sequentially and blocks.
 - **Auto-start/stop**: Streams start when client requests HLS playlist, stop after 30s idle (watchdog thread checks every 5s). Applies to both live and VOD.
-- **Single NVENC session for VOD**: `MAX_VOD_PIPELINES = 1` leaves room for live streams.
 - **No VOD catalog persistence**: Rebuilt from M3U on each boot (~2s parsing for 16K movies).
 - **M3U absolute URL rewriting**: HLS playlists served via XC API routes rewrite relative segment filenames to absolute URLs so players fetch segments from correct `/stream/` or `/vod/` paths.
 - **XC API accepts any credentials**: No auth validation — returns `auth: 1` for all username/password combos.

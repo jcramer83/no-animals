@@ -1,6 +1,8 @@
 """
-Censor animals in a video file using YOLOv8 object detection.
+Censor animals in a video file using YOLOv8 object detection (OpenVINO backend).
 Draws black boxes over any detected animals and re-encodes with audio.
+
+Linux/Docker port — uses VAAPI hardware encode when available, falls back to libx264.
 
 Usage:
     python censor_animals.py input_video.mkv
@@ -47,6 +49,19 @@ PERSIST_FRAMES = 12    # Keep a box visible for this many frames after last dete
 SMOOTH_WINDOW = 5      # Average box coordinates over this many frames
 
 
+def _detect_hwaccel():
+    """Returns 'vaapi' or 'cpu' based on runtime iGPU availability."""
+    if not os.path.exists("/dev/dri/renderD128"):
+        return "cpu"
+    try:
+        r = subprocess.run(["vainfo"], capture_output=True, text=True, timeout=10)
+        if "VAProfileH264" in r.stdout or "VAProfileH264" in r.stderr:
+            return "vaapi"
+    except Exception:
+        pass
+    return "cpu"
+
+
 def iou(box_a, box_b):
     """Compute intersection-over-union of two [x1,y1,x2,y2] boxes."""
     xa = max(box_a[0], box_b[0])
@@ -70,28 +85,22 @@ class BoxTracker:
         self.next_id = 0
 
     def update(self, detections):
-        """Update tracks with new frame detections. Returns smoothed boxes to draw.
-
-        detections: list of [x1, y1, x2, y2] boxes (already padded)
-        """
-        # Try to match each detection to an existing track via IoU
+        """Update tracks with new frame detections. Returns smoothed boxes to draw."""
         used_tracks = set()
         used_dets = set()
 
-        # Score all pairs
         pairs = []
         for ti, track in enumerate(self.tracks):
             avg_box = self._avg_box(track["history"])
             for di, det in enumerate(detections):
                 score = iou(avg_box, det)
-                if score > 0.15:  # loose threshold to keep matching
+                if score > 0.15:
                     pairs.append((score, ti, di))
         pairs.sort(reverse=True)
 
         for score, ti, di in pairs:
             if ti in used_tracks or di in used_dets:
                 continue
-            # Update existing track
             self.tracks[ti]["history"].append(detections[di])
             if len(self.tracks[ti]["history"]) > self.smooth_window:
                 self.tracks[ti]["history"] = self.tracks[ti]["history"][-self.smooth_window:]
@@ -99,7 +108,6 @@ class BoxTracker:
             used_tracks.add(ti)
             used_dets.add(di)
 
-        # Create new tracks for unmatched detections
         for di, det in enumerate(detections):
             if di not in used_dets:
                 self.tracks.append({
@@ -109,15 +117,12 @@ class BoxTracker:
                 })
                 self.next_id += 1
 
-        # Age out unmatched tracks
         for ti, track in enumerate(self.tracks):
             if ti not in used_tracks:
                 track["frames_since_seen"] += 1
 
-        # Remove expired tracks
         self.tracks = [t for t in self.tracks if t["frames_since_seen"] <= self.persist_frames]
 
-        # Return smoothed boxes for all active tracks
         result = []
         for track in self.tracks:
             result.append(self._avg_box(track["history"]))
@@ -131,7 +136,7 @@ class BoxTracker:
 
 def get_video_info(input_path):
     """Get video metadata using ffprobe."""
-    ffprobe = FFMPEG_PATH.replace("ffmpeg.exe", "ffprobe.exe")
+    ffprobe = shutil.which("ffprobe") or FFMPEG_PATH.replace("ffmpeg", "ffprobe")
     cmd = [
         ffprobe, "-v", "quiet",
         "-print_format", "json",
@@ -160,8 +165,8 @@ def main():
                         help="Detection confidence threshold (default: 0.2)")
     parser.add_argument("--padding", "-p", type=int, default=30,
                         help="Extra pixels around detection box (default: 30)")
-    parser.add_argument("--model", "-m", default="yolov8m.pt",
-                        help="YOLO model to use (default: yolov8m.pt)")
+    parser.add_argument("--model", "-m", default="yolov8m_openvino_model",
+                        help="YOLO model to use (default: yolov8m_openvino_model)")
     parser.add_argument("--persist", type=int, default=PERSIST_FRAMES,
                         help=f"Frames to keep box after detection lost (default: {PERSIST_FRAMES})")
     parser.add_argument("--smooth", type=int, default=SMOOTH_WINDOW,
@@ -182,6 +187,9 @@ def main():
     # Temp file for video-only output (we'll mux audio in at the end)
     temp_video = output_path.with_stem(output_path.stem + "_tempvideo")
 
+    # Detect hardware acceleration
+    hwaccel = _detect_hwaccel()
+
     print(f"Input:      {input_path}")
     print(f"Output:     {output_path}")
     print(f"Model:      {args.model}")
@@ -189,6 +197,7 @@ def main():
     print(f"Padding:    {args.padding}px")
     print(f"Persist:    {args.persist} frames")
     print(f"Smooth:     {args.smooth} frames")
+    print(f"HW Accel:   {hwaccel}")
     print()
 
     # Get video info
@@ -218,11 +227,10 @@ def main():
     print(f"Audio:      {'yes' if has_audio else 'no'}")
     print()
 
-    # Load YOLO model
+    # Load YOLO model (OpenVINO)
     print("Loading YOLO model...")
     model = YOLO(args.model)
-    model.to("cuda")
-    print("Model loaded on GPU")
+    print("Model loaded")
     print()
 
     # Use OpenCV to read frames and write video-only temp file
@@ -251,7 +259,7 @@ def main():
         if not ret:
             break
 
-        # Run YOLO detection
+        # Run YOLO detection (no half=True — OpenVINO uses precision from export)
         results = model.predict(frame, conf=args.confidence, verbose=False, classes=list(ANIMAL_CLASS_IDS))
 
         # Collect raw detections with padding
@@ -298,18 +306,30 @@ def main():
 
     elapsed_total = time.time() - start_time
     print(f"\nFrame processing done in {format_time(elapsed_total)}.")
-    print(f"Muxing audio/subtitles with FFmpeg (NVENC re-encode)...")
+    print(f"Muxing audio/subtitles with FFmpeg ({hwaccel} encode)...")
 
-    # Now use FFmpeg to combine the processed video with original audio/subs
+    # Build mux command based on hardware acceleration
     mux_cmd = [
         FFMPEG_PATH, "-y",
         "-i", str(temp_video),
         "-i", str(input_path),
         "-map", "0:v",
-        "-c:v", "h264_nvenc",
-        "-preset", "p4",
-        "-cq", "20",
     ]
+
+    if hwaccel == "vaapi":
+        mux_cmd += [
+            "-vaapi_device", "/dev/dri/renderD128",
+            "-vf", "format=nv12,hwupload",
+            "-c:v", "h264_vaapi",
+            "-b:v", "4M", "-maxrate", "6M",
+        ]
+    else:
+        mux_cmd += [
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-preset", "fast",
+            "-b:v", "4M", "-maxrate", "6M", "-bufsize", "8M",
+        ]
 
     if has_audio:
         mux_cmd += ["-map", "1:a", "-c:a", "copy"]

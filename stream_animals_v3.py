@@ -1,18 +1,14 @@
 """
 Real-Time IPTV Animal Censoring Stream Server v3 — multi-stream architecture.
-
-Discovers up to 3 Hallmark channels from M3U playlist, each with its own
-independent pipeline (decoder → YOLO → encoder → HLS). Streams auto-start
-on first client request and auto-stop after 30s of inactivity.
+Linux/Docker port — uses VAAPI hardware accel (Intel iGPU) with CPU fallback,
+OpenVINO for YOLO inference instead of CUDA.
 
 Pipeline per stream:
   Decoder FFmpeg ──TCP:port+1──▶ Python ──TCP:port+2──▶ Encoder FFmpeg ──▶ HLS
   Decoder FFmpeg ──TCP:port+0──────────────────────────▶ Encoder FFmpeg (audio)
 
-Port allocation: stream 0 = 19876-19878, stream 1 = 19886-19888, stream 2 = 19896-19898
-
 Usage:
-    py -3 stream_animals_v3.py
+    python stream_animals_v3.py
     Open http://localhost:8080
 """
 
@@ -39,19 +35,10 @@ from PIL import Image, ImageDraw, ImageFont
 # Constants
 # ---------------------------------------------------------------------------
 
-_WINGET_FFMPEG = str(Path.home() / "AppData/Local/Microsoft/WinGet/Packages/Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe/ffmpeg-8.0.1-full_build/bin/ffmpeg.exe")
-FFMPEG = (
-    shutil.which("ffmpeg")
-    or os.environ.get("FFMPEG_PATH")
-    or (_WINGET_FFMPEG if Path(_WINGET_FFMPEG).exists() else None)
-)
+FFMPEG = shutil.which("ffmpeg") or os.environ.get("FFMPEG_PATH")
 if not FFMPEG:
     raise RuntimeError("ffmpeg not found on PATH. Install FFmpeg or set the FFMPEG_PATH environment variable.")
-FFPROBE = (
-    shutil.which("ffprobe")
-    or os.environ.get("FFPROBE_PATH")
-    or str(Path(FFMPEG).with_name("ffprobe.exe" if os.name == "nt" else "ffprobe"))
-)
+FFPROBE = shutil.which("ffprobe") or os.environ.get("FFPROBE_PATH") or str(Path(FFMPEG).with_name("ffprobe"))
 
 W, H   = 1920, 1080
 FPS    = 30.0
@@ -65,10 +52,85 @@ ANIMAL_CLASS_NAMES = {
 }
 
 MAX_STREAMS = 10
-MAX_VOD_PIPELINES = 3       # GPU NVENC session limit is the real constraint
+MAX_VOD_PIPELINES = 3
 VOD_PORT_BASE = 19976       # well above live range 19876-19898
 CLIENT_TIMEOUT = 30      # seconds with no requests before auto-stop (live)
 VOD_CLIENT_TIMEOUT = 300  # 5 minutes for VOD (players buffer ahead and go idle)
+
+# ---------------------------------------------------------------------------
+# Hardware acceleration detection
+# ---------------------------------------------------------------------------
+
+_hwaccel_cache = None
+
+def _detect_hwaccel():
+    """Returns 'vaapi' or 'cpu' based on runtime iGPU availability."""
+    global _hwaccel_cache
+    if _hwaccel_cache is not None:
+        return _hwaccel_cache
+    if not os.path.exists("/dev/dri/renderD128"):
+        print("[hwaccel] /dev/dri/renderD128 not found, using CPU", flush=True)
+        _hwaccel_cache = "cpu"
+        return "cpu"
+    try:
+        r = subprocess.run(["vainfo"], capture_output=True, text=True, timeout=10)
+        output = r.stdout + r.stderr
+        if "VAProfileH264" in output:
+            print("[hwaccel] VAAPI detected with H.264 support", flush=True)
+            _hwaccel_cache = "vaapi"
+            return "vaapi"
+    except Exception as e:
+        print(f"[hwaccel] vainfo check failed: {e}", flush=True)
+    print("[hwaccel] No VAAPI H.264 support, using CPU", flush=True)
+    _hwaccel_cache = "cpu"
+    return "cpu"
+
+# ---------------------------------------------------------------------------
+# Font helper
+# ---------------------------------------------------------------------------
+
+_font_cache = {}
+
+def _find_font(size, bold=True):
+    """Find a suitable font: Liberation Sans > DejaVu Sans > default."""
+    key = (size, bold)
+    if key in _font_cache:
+        return _font_cache[key]
+    candidates = []
+    if bold:
+        candidates = [
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        ]
+    else:
+        candidates = [
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+    for path in candidates:
+        try:
+            font = ImageFont.truetype(path, size)
+            _font_cache[key] = font
+            return font
+        except OSError:
+            continue
+    font = ImageFont.load_default()
+    _font_cache[key] = font
+    return font
+
+
+def _find_emoji_font(size):
+    """Find an emoji font (Noto Color Emoji on Linux)."""
+    candidates = [
+        "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+        "/usr/share/fonts/noto-color-emoji/NotoColorEmoji.ttf",
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    return None
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -88,17 +150,12 @@ def rounded_rect_mask(h, w, radius):
     r = min(radius, h // 2, w // 2)
     if r <= 0:
         return mask
-    # Create corner circles using coordinate grids
     yy, xx = np.ogrid[:r, :r]
     dist = (r - 1 - xx) ** 2 + (r - 1 - yy) ** 2
     corner = (dist <= r * r).astype(np.float32)
-    # Top-left
     mask[:r, :r] = corner
-    # Top-right
     mask[:r, w-r:] = corner[:, ::-1]
-    # Bottom-left
     mask[h-r:, :r] = corner[::-1, :]
-    # Bottom-right
     mask[h-r:, w-r:] = corner[::-1, ::-1]
     return mask
 
@@ -247,16 +304,55 @@ def drain_stderr(proc, log_path=None):
 
 
 # ---------------------------------------------------------------------------
+# Encoder/Decoder command builders
+# ---------------------------------------------------------------------------
+
+def _build_encoder_codec_args(hwaccel):
+    """Return FFmpeg encoder codec arguments for VAAPI or CPU."""
+    if hwaccel == "vaapi":
+        return [
+            "-vaapi_device", "/dev/dri/renderD128",
+            "-vf", "format=nv12,hwupload",
+            "-c:v", "h264_vaapi",
+            "-b:v", "4M", "-maxrate", "6M", "-bufsize", "8M",
+            "-g", str(int(FPS * 2)),
+        ]
+    else:
+        return [
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-preset", "fast",
+            "-b:v", "4M", "-maxrate", "6M", "-bufsize", "8M",
+            "-g", str(int(FPS * 2)),
+        ]
+
+
+def _build_decoder_hwaccel_args(hwaccel):
+    """Return FFmpeg decoder hardware accel args."""
+    if hwaccel == "vaapi":
+        return ["-hwaccel", "vaapi", "-hwaccel_device", "/dev/dri/renderD128",
+                "-hwaccel_output_format", "vaapi"]
+    return []
+
+
+def _build_decoder_vf(hwaccel):
+    """Return video filter string for decoder."""
+    if hwaccel == "vaapi":
+        return f"fps={FPS:.2f},scale_vaapi=w={W}:h={H},hwdownload,format=nv12"
+    return f"fps={FPS:.2f},scale={W}:{H}"
+
+
+# ---------------------------------------------------------------------------
 # Shared state
 # ---------------------------------------------------------------------------
 
-SETTINGS_FILE = Path(__file__).parent / "noanimals_settings.json"
+SETTINGS_FILE = Path(__file__).parent / "data" / "noanimals_settings.json"
 
 config_lock = threading.Lock()
 _default_config = {
     "confidence": 0.4,
     "padding": 30,
-    "model": "yolov8x.pt",
+    "model": "yolov8s_openvino_model",
     "persist_frames": 2,
     "smooth_window": 5,
     "overlay": "text",
@@ -284,7 +380,7 @@ def _load_config():
 
 def _load_m3u_state():
     """Load saved M3U state (url, channels, last_fetched) from settings file."""
-    state = {"m3u_url": "", "channels": [], "all_channels": [], "last_fetched": None, "last_error": "", "fetching": False}
+    state = {"m3u_url": os.environ.get("M3U_URL", ""), "channels": [], "all_channels": [], "last_fetched": None, "last_error": "", "fetching": False}
     try:
         if SETTINGS_FILE.exists():
             with open(SETTINGS_FILE, "r") as f:
@@ -305,6 +401,7 @@ def _load_m3u_state():
 def _save_config():
     """Save current config + M3U state to disk (call while holding config_lock)."""
     try:
+        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
         data = dict(config)
         with m3u_lock:
             data["m3u_url"] = m3u_state["m3u_url"]
@@ -420,7 +517,6 @@ class StreamInstance:
     def seek_restart(self, target_time):
         """Restart pipeline seeking to target_time seconds. Thread-safe via _seek_lock."""
         if not self._seek_lock.acquire(blocking=False):
-            # Another seek is already in progress — skip this one
             print(f"[{self.slug}] seek to {target_time:.0f}s skipped — another seek in progress", flush=True)
             return
         try:
@@ -428,15 +524,13 @@ class StreamInstance:
             seg_num = int(target_time / HLS_TIME)
             self.seek_offset = target_time
             self.hls_start_number = seg_num
-            self.keep_segments = True   # preserve previously processed segments
+            self.keep_segments = True
             if seg_num not in self._discontinuities:
                 self._discontinuities.append(seg_num)
             self.stop()
-            # Force-kill pipeline procs for faster restart
             for p in self.pipeline_procs:
                 try: p.kill()
                 except Exception: pass
-            # Wait for pipeline to actually stop (shorter timeout)
             for _ in range(40):  # 4s max
                 with self.stats_lock:
                     st = self.stats["status"]
@@ -455,6 +549,7 @@ class StreamInstance:
         """Main pipeline: decode -> process -> encode. Runs in a background thread."""
         tag = self.slug
         self._pipeline_gen += 1
+        hwaccel = _detect_hwaccel()
 
         with self.stats_lock:
             self.stats.update({"status": "probing", "fps": 0, "detections_count": 0,
@@ -479,7 +574,7 @@ class StreamInstance:
         src_w, src_h = probe.get("width", 0), probe.get("height", 0)
         if probe.get("duration", 0) > 0:
             self.total_duration = probe["duration"]
-        print(f"[{tag}] probe: src={src_w}x{src_h} fps={probe['fps']:.1f} audio={has_audio} dur={self.total_duration:.0f}s out={W}x{H}@{FPS}", flush=True)
+        print(f"[{tag}] probe: src={src_w}x{src_h} fps={probe['fps']:.1f} audio={has_audio} dur={self.total_duration:.0f}s out={W}x{H}@{FPS} hwaccel={hwaccel}", flush=True)
 
         # --- Clean output dir (skip if keeping segments for seek) ---
         if not self.keep_segments:
@@ -517,11 +612,7 @@ class StreamInstance:
                 "-i", f"tcp://127.0.0.1:{self.v_out_port}?listen=1",
             ]
             enc_cmd += ["-map", "0:v"]
-        enc_cmd += [
-            "-c:v", "h264_nvenc", "-pix_fmt", "yuv420p",
-            "-preset", "p4", "-b:v", "4M", "-maxrate", "6M", "-bufsize", "8M",
-            "-g", str(int(FPS * 2)),
-        ]
+        enc_cmd += _build_encoder_codec_args(hwaccel)
         if has_audio:
             enc_cmd += ["-c:a", "aac", "-b:a", "128k"]
         # For VOD seek: offset encoder timestamps to match playlist position
@@ -530,7 +621,7 @@ class StreamInstance:
         if self.is_vod:
             hls_list_size = "0"
             hls_flags = "independent_segments"
-            hls_playlist_type = None      # no type — avoids EVENT confusion in IPTV players
+            hls_playlist_type = None
             start_num = self.hls_start_number
         else:
             hls_playlist_type = None
@@ -551,7 +642,6 @@ class StreamInstance:
         print(f"[{tag}] encoder: {' '.join(enc_cmd)}", flush=True)
         enc_proc = subprocess.Popen(
             enc_cmd, stdin=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.ABOVE_NORMAL_PRIORITY_CLASS,
         )
         self.pipeline_procs.append(enc_proc)
         drain_stderr(enc_proc, str(self.out_dir / "encoder.log"))
@@ -567,13 +657,12 @@ class StreamInstance:
         dec_cmd = [FFMPEG, "-y"]
         if self.seek_offset > 0:
             dec_cmd += ["-ss", f"{self.seek_offset:.3f}"]
-        dec_cmd += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-        if not self.is_vod:
-            dec_cmd += ["-c:v", "h264_cuvid"]
+        dec_cmd += _build_decoder_hwaccel_args(hwaccel)
+        # No codec hint — let FFmpeg auto-detect for both live and VOD
 
         # Build video filter chain — scale to output resolution
         self.pad_y = 0
-        vf = f"fps={FPS:.2f},scale_cuda={W}:{H},hwdownload,format=nv12"
+        vf = _build_decoder_vf(hwaccel)
 
         dec_cmd += ["-i", self.stream_url]
         if self.is_vod:
@@ -594,7 +683,6 @@ class StreamInstance:
         dec_proc = subprocess.Popen(
             dec_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
-            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.ABOVE_NORMAL_PRIORITY_CLASS,
         )
         self.pipeline_procs.append(dec_proc)
         drain_stderr(dec_proc, str(self.out_dir / "decoder.log"))
@@ -638,7 +726,7 @@ class StreamInstance:
             v_in_conn.close()
             return
 
-        # --- Load YOLO model ---
+        # --- Load YOLO model (OpenVINO) ---
         from ultralytics import YOLO
 
         with config_lock:
@@ -649,7 +737,6 @@ class StreamInstance:
             smooth = config["smooth_window"]
 
         model = YOLO(model_name)
-        model.to("cuda")
         tracker = BoxTracker(persist, smooth)
         cur_model = model_name
 
@@ -699,7 +786,6 @@ class StreamInstance:
             if new_model != cur_model:
                 cur_model = new_model
                 model = YOLO(cur_model)
-                model.to("cuda")
                 tracker = BoxTracker(persist, smooth)
             tracker.persist = persist
             tracker.smooth = smooth
@@ -707,7 +793,7 @@ class StreamInstance:
             if frame_count % DETECT_EVERY == 0:
                 results = model.predict(frame, conf=conf, verbose=False,
                                         classes=list(ANIMAL_CLASS_IDS),
-                                        half=True, imgsz=480)
+                                        imgsz=480)
                 raw_boxes = []
                 raw_classes = []
                 for r in results:
@@ -725,7 +811,6 @@ class StreamInstance:
                 # Count only newly confirmed tracks (unique animal instances)
                 for t in tracker.tracks:
                     if t["id"] >= next_id_before:
-                        # New track — match to detection by box coords
                         for i, rb in enumerate(raw_boxes):
                             if rb == t["h"][-1]:
                                 animal_counts[raw_classes[i]] = animal_counts.get(raw_classes[i], 0) + 1
@@ -741,18 +826,15 @@ class StreamInstance:
                 radius = max(12, min(rh, rw) // 6)
                 mask = rounded_rect_mask(rh, rw, radius)[:, :, None]
                 if censor_mode == "blur":
-                    # Crush detail: downscale to tiny, upscale, then blur smooth
                     tiny = cv2.resize(roi, (max(1, rw // 40), max(1, rh // 40)),
                                       interpolation=cv2.INTER_AREA)
                     blurred = cv2.resize(tiny, (rw, rh), interpolation=cv2.INTER_LINEAR)
                     ksize = max(51, (min(rh, rw) // 3) | 1)
                     blurred = cv2.GaussianBlur(blurred, (ksize, ksize), 0)
-                    # Flood toward average color to kill any remaining shape
                     avg = blurred.mean(axis=(0, 1)).astype(np.float32)
                     blurred = (blurred.astype(np.float32) * 0.3 + avg * 0.7).astype(np.uint8)
                     frame[y1c:y2c, x1c:x2c] = (roi * (1 - mask) + blurred * mask).astype(np.uint8)
                 elif censor_mode == "fine_blur":
-                    # Finer blur: downscale to 1/12th (not 1/40th), lighter Gaussian, moderate color flood
                     tiny = cv2.resize(roi, (max(1, rw // 12), max(1, rh // 12)),
                                       interpolation=cv2.INTER_AREA)
                     blurred = cv2.resize(tiny, (rw, rh), interpolation=cv2.INTER_LINEAR)
@@ -778,8 +860,6 @@ class StreamInstance:
             ov = OVERLAY_MAP.get(overlay_mode)
             if ov is not None:
                 if self.is_vod:
-                    # Bottom-left, 180px from bottom edge to clear letterbox bars
-                    # on even the widest aspect ratios (2.39:1 bars ≈ 138px)
                     ov_y = H - 180 - ov.shape[0]
                     apply_overlay(frame, ov, 16, max(0, ov_y))
                 else:
@@ -829,7 +909,6 @@ class StreamInstance:
 
         if self.is_vod:
             if self.completed:
-                # Ensure ENDLIST is written (safety fallback)
                 m3u8_path = self.out_dir / f"{self.slug}.m3u8"
                 try:
                     if m3u8_path.exists():
@@ -839,7 +918,6 @@ class StreamInstance:
                                 f.write("#EXT-X-ENDLIST\n")
                 except Exception:
                     pass
-                # Delayed cleanup: give clients 5 min to finish downloading segments
                 gen_at_cleanup = self._pipeline_gen
                 def _delayed_vod_cleanup(xui_id, out_dir, gen):
                     time.sleep(300)
@@ -855,8 +933,6 @@ class StreamInstance:
                                  args=(self.xui_id, self.out_dir, gen_at_cleanup), daemon=True).start()
                 print(f"[{tag}] VOD completed, cleanup in 5 min", flush=True)
             else:
-                # Stopped early — write ENDLIST so player can finish watching buffered content,
-                # then delayed cleanup
                 m3u8_path = self.out_dir / f"{self.slug}.m3u8"
                 try:
                     if m3u8_path.exists():
@@ -895,6 +971,7 @@ class StreamInstance:
     def run_pipeline_stdout(self):
         """Pipeline outputting MPEG-TS to encoder stdout. Runs in a background thread."""
         tag = self.slug
+        hwaccel = _detect_hwaccel()
 
         with self.stats_lock:
             self.stats.update({"status": "probing", "fps": 0, "detections_count": 0,
@@ -913,7 +990,7 @@ class StreamInstance:
             return
         has_audio = probe["has_audio"]
         src_w, src_h = probe.get("width", 0), probe.get("height", 0)
-        print(f"[{tag}] probe: src={src_w}x{src_h} fps={probe['fps']:.1f} audio={has_audio} out={W}x{H}@{FPS}", flush=True)
+        print(f"[{tag}] probe: src={src_w}x{src_h} fps={probe['fps']:.1f} audio={has_audio} out={W}x{H}@{FPS} hwaccel={hwaccel}", flush=True)
 
         self.stop_event.clear()
         self.pipeline_procs = []
@@ -945,11 +1022,7 @@ class StreamInstance:
                 "-i", f"tcp://127.0.0.1:{self.v_out_port}?listen=1",
             ]
             enc_cmd += ["-map", "0:v"]
-        enc_cmd += [
-            "-c:v", "h264_nvenc", "-pix_fmt", "yuv420p",
-            "-preset", "p4", "-b:v", "4M", "-maxrate", "6M", "-bufsize", "8M",
-            "-g", str(int(FPS * 2)),
-        ]
+        enc_cmd += _build_encoder_codec_args(hwaccel)
         if has_audio:
             enc_cmd += ["-c:a", "aac", "-b:a", "128k"]
         enc_cmd += ["-f", "mpegts", "pipe:1"]
@@ -957,7 +1030,6 @@ class StreamInstance:
         print(f"[{tag}] encoder (stdout): {' '.join(enc_cmd)}", flush=True)
         enc_proc = subprocess.Popen(
             enc_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.ABOVE_NORMAL_PRIORITY_CLASS,
         )
         self.pipeline_procs.append(enc_proc)
         self.encoder_proc = enc_proc
@@ -971,20 +1043,18 @@ class StreamInstance:
                 print(f"[{tag}] WARNING: audio port check timed out", flush=True)
 
         # --- Start decoder FFmpeg ---
-        dec_cmd = [FFMPEG, "-y",
-                   "-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-        if not self.is_vod:
-            dec_cmd += ["-c:v", "h264_cuvid"]
+        dec_cmd = [FFMPEG, "-y"]
+        dec_cmd += _build_decoder_hwaccel_args(hwaccel)
         if self.seek_offset > 0:
             dec_cmd += ["-ss", f"{self.seek_offset:.3f}"]
 
         # Build video filter chain — scale to output resolution
         self.pad_y = 0
-        vf = f"fps={FPS:.2f},scale_cuda={W}:{H},hwdownload,format=nv12"
+        vf = _build_decoder_vf(hwaccel)
 
         dec_cmd += ["-i", self.stream_url]
         if self.is_vod:
-            dec_cmd += ["-sn"]  # no subtitles/closed captions for VOD
+            dec_cmd += ["-sn"]
         dec_cmd += [
             "-map", "0:v:0",
             "-vf", vf,
@@ -1001,7 +1071,6 @@ class StreamInstance:
         dec_proc = subprocess.Popen(
             dec_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
-            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.ABOVE_NORMAL_PRIORITY_CLASS,
         )
         self.pipeline_procs.append(dec_proc)
         drain_stderr(dec_proc)
@@ -1048,7 +1117,7 @@ class StreamInstance:
             self.pipeline_ready.set()
             return
 
-        # --- Load YOLO model ---
+        # --- Load YOLO model (OpenVINO) ---
         from ultralytics import YOLO
 
         with config_lock:
@@ -1059,7 +1128,6 @@ class StreamInstance:
             smooth = config["smooth_window"]
 
         model = YOLO(model_name)
-        model.to("cuda")
         tracker = BoxTracker(persist, smooth)
         cur_model = model_name
 
@@ -1111,7 +1179,6 @@ class StreamInstance:
             if new_model != cur_model:
                 cur_model = new_model
                 model = YOLO(cur_model)
-                model.to("cuda")
                 tracker = BoxTracker(persist, smooth)
             tracker.persist = persist
             tracker.smooth = smooth
@@ -1119,7 +1186,7 @@ class StreamInstance:
             if frame_count % DETECT_EVERY == 0:
                 results = model.predict(frame, conf=conf, verbose=False,
                                         classes=list(ANIMAL_CLASS_IDS),
-                                        half=True, imgsz=480)
+                                        imgsz=480)
                 raw_boxes = []
                 raw_classes = []
                 for r in results:
@@ -1185,8 +1252,6 @@ class StreamInstance:
             ov = OVERLAY_MAP.get(overlay_mode)
             if ov is not None:
                 if self.is_vod:
-                    # Bottom-left, 180px from bottom edge to clear letterbox bars
-                    # on even the widest aspect ratios (2.39:1 bars ≈ 138px)
                     ov_y = H - 180 - ov.shape[0]
                     apply_overlay(frame, ov, 16, max(0, ov_y))
                 else:
@@ -1281,15 +1346,13 @@ def fetch_m3u():
             all_channels = []
             all_slugs = set()
             movies = {}
-            pending_extinf = None  # raw #EXTINF line
+            pending_extinf = None
             for raw_line in resp:
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if pending_extinf is not None:
-                    # This line is the URL for the previous #EXTINF
                     extinf = pending_extinf
                     pending_extinf = None
 
-                    # --- Check for VOD movie first (URL ends with #.mkv / #.mp4 / #.avi) ---
                     xui_m = re.search(r'xui-id="([^"]*)"', extinf, re.IGNORECASE)
                     ext_m = re.search(r'#\.(mkv|mp4|avi)$', line, re.IGNORECASE)
                     if xui_m and ext_m:
@@ -1297,14 +1360,12 @@ def fetch_m3u():
                         orig_ext = ext_m.group(1).lower()
                         name_m = re.search(r'tvg-name="([^"]*)"', extinf, re.IGNORECASE)
                         vod_name = name_m.group(1) if name_m else f"Movie {xui_id}"
-                        # Skip TV show episodes (e.g. "S01E01", "S2E14")
                         if re.search(r'S\d+E\d+', vod_name, re.IGNORECASE):
                             continue
                         logo_m = re.search(r'tvg-logo="([^"]*)"', extinf, re.IGNORECASE)
                         group_m = re.search(r'group-title="([^"]*)"', extinf, re.IGNORECASE)
                         vod_logo = logo_m.group(1) if logo_m else ""
                         vod_group = group_m.group(1) if group_m else ""
-                        # Strip #.ext fragment from URL so FFmpeg gets clean URL
                         clean_url = re.sub(r'#\.[a-zA-Z0-9]+$', '', line)
                         movies[xui_id] = {
                             "xui_id": xui_id,
@@ -1316,7 +1377,6 @@ def fetch_m3u():
                         }
                         continue
 
-                    # --- Cache live channel entry (all channels, no filter check) ---
                     _name_m = re.search(r'tvg-name="([^"]*)"', extinf, re.IGNORECASE)
                     name = _name_m.group(1) if _name_m else "Channel"
                     slug = slugify(name)
@@ -1345,18 +1405,15 @@ def fetch_m3u():
             m3u_state["last_error"] = ""
         print(f"[m3u] cached {len(all_channels)} live channel entries", flush=True)
 
-        # Store VOD catalog
         with vod_lock:
             vod_catalog.clear()
             vod_catalog.update(movies)
         if movies:
             print(f"[m3u] found {len(movies)} VOD movies", flush=True)
 
-        # Apply current filters to cached channels and sync streams
         count = _apply_filters()
         print(f"[m3u] {count} channel(s) match current filters", flush=True)
 
-        # If a re-fetch was requested while we were downloading, do it again
         global _m3u_refetch_needed
         if _m3u_refetch_needed:
             _m3u_refetch_needed = False
@@ -1389,7 +1446,6 @@ def _sync_streams(channels):
                 streams[slug] = inst
                 print(f"[streams] created instance '{slug}' ports {port_base}-{port_base+2}", flush=True)
             else:
-                # Update URL/metadata in case it changed
                 streams[slug].stream_url = ch["url"]
                 streams[slug].channel_name = ch["name"]
                 streams[slug].logo = ch.get("logo", "")
@@ -1403,7 +1459,7 @@ def _apply_filters():
     with m3u_lock:
         all_ch = list(m3u_state.get("all_channels", []))
     if not all_ch:
-        return -1  # Cache not yet populated, need full fetch
+        return -1
     with config_lock:
         filters = list(config.get("channel_filters", ["hallmark"]))
     channels = []
@@ -1431,35 +1487,23 @@ def _apply_filters():
 
 def _build_text_overlay():
     """Render 'NoAnimals' text overlay matching the dashboard header style."""
-    try:
-        font = ImageFont.truetype("segoeuib.ttf", 28)  # Segoe UI Bold
-    except OSError:
-        try:
-            font = ImageFont.truetype("arialbd.ttf", 28)
-        except OSError:
-            font = ImageFont.load_default()
-    # Measure each part separately: "No" in accent red, "Animals" in white
+    font = _find_font(28, bold=True)
     tmp = Image.new("RGBA", (1, 1))
     draw = ImageDraw.Draw(tmp)
     no_bbox = draw.textbbox((0, 0), "No", font=font)
     no_w = no_bbox[2] - no_bbox[0]
     full_bbox = draw.textbbox((0, 0), "NoAnimals", font=font)
     full_w, full_h = full_bbox[2] - full_bbox[0], full_bbox[3] - full_bbox[1]
-    # Create image with padding
     pad = 10
     w, h = full_w + pad * 2, full_h + pad * 2
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     y_off = pad - full_bbox[1]
-    # Dark shadow for readability on video
     draw.text((pad + 1, y_off + 1), "NoAnimals", font=font, fill=(0, 0, 0, 140))
-    # "No" in accent red #e94560
     draw.text((pad, y_off), "No", font=font, fill=(233, 69, 96, 240))
-    # "Animals" in white, offset by "No" width
     draw.text((pad + no_w, y_off), "Animals", font=font, fill=(255, 255, 255, 240))
-    # Convert RGBA to BGRA for OpenCV
     arr = np.array(img)
-    arr[:, :, :3] = arr[:, :, 2::-1]  # RGB -> BGR
+    arr[:, :, :3] = arr[:, :, 2::-1]
     return arr
 
 
@@ -1470,25 +1514,24 @@ def _build_graphic_overlay():
     draw = ImageDraw.Draw(img)
     cx, cy, r = size // 2, size // 2, 42
 
-    # Render dog emoji using Windows Segoe UI Emoji font
-    try:
-        font = ImageFont.truetype("seguiemj.ttf", 62)
+    efont = _find_emoji_font(62)
+    if efont:
         dog = "\U0001F415"
-        bbox = draw.textbbox((0, 0), dog, font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        x = (size - tw) // 2 - bbox[0]
-        y = (size - th) // 2 - bbox[1] + 2
-        draw.text((x, y), dog, font=font, embedded_color=True)
-    except (OSError, AttributeError):
-        # Fallback: simple filled circle with "D" if emoji font unavailable
-        draw.ellipse([20, 20, 76, 76], fill=(200, 180, 120, 200))
         try:
-            fb = ImageFont.truetype("arial.ttf", 36)
-        except OSError:
-            fb = ImageFont.load_default()
+            bbox = draw.textbbox((0, 0), dog, font=efont)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            x = (size - tw) // 2 - bbox[0]
+            y = (size - th) // 2 - bbox[1] + 2
+            draw.text((x, y), dog, font=efont, embedded_color=True)
+        except (OSError, AttributeError):
+            draw.ellipse([20, 20, 76, 76], fill=(200, 180, 120, 200))
+            fb = _find_font(36, bold=False)
+            draw.text((35, 28), "D", font=fb, fill=(80, 60, 30, 230))
+    else:
+        draw.ellipse([20, 20, 76, 76], fill=(200, 180, 120, 200))
+        fb = _find_font(36, bold=False)
         draw.text((35, 28), "D", font=fb, fill=(80, 60, 30, 230))
 
-    # Prohibition sign
     ring_w = 5
     draw.ellipse([cx - r, cy - r, cx + r, cy + r],
                  outline=(233, 69, 96, 230), width=ring_w)
@@ -1496,7 +1539,6 @@ def _build_graphic_overlay():
     draw.line([(cx - offset, cy - offset), (cx + offset, cy + offset)],
               fill=(233, 69, 96, 230), width=ring_w)
 
-    # Convert RGBA to BGRA
     arr = np.array(img)
     arr[:, :, :3] = arr[:, :, 2::-1]
     return arr
@@ -1504,13 +1546,7 @@ def _build_graphic_overlay():
 
 def _build_petfree_overlay():
     """Render 'Pet Free TV' retro badge overlay as BGRA numpy array."""
-    try:
-        font = ImageFont.truetype("segoeuib.ttf", 22)
-    except OSError:
-        try:
-            font = ImageFont.truetype("arialbd.ttf", 22)
-        except OSError:
-            font = ImageFont.load_default()
+    font = _find_font(22, bold=True)
     tmp = Image.new("RGBA", (1, 1))
     draw = ImageDraw.Draw(tmp)
     bbox = draw.textbbox((0, 0), "PET FREE TV", font=font)
@@ -1519,10 +1555,8 @@ def _build_petfree_overlay():
     w, h = tw + pad_x * 2, th + pad_y * 2
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    # Rounded dark background pill
     draw.rounded_rectangle([0, 0, w - 1, h - 1], radius=10, fill=(15, 15, 26, 180),
                            outline=(233, 69, 96, 200), width=2)
-    # White text with accent star
     draw.text((pad_x - bbox[0], pad_y - bbox[1]), "PET FREE TV", font=font,
               fill=(255, 255, 255, 230))
     arr = np.array(img)
@@ -1536,15 +1570,18 @@ def _build_paw_overlay():
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     cx, cy, r = size // 2, size // 2, 42
-    try:
-        font = ImageFont.truetype("seguiemj.ttf", 58)
+    efont = _find_emoji_font(58)
+    if efont:
         paw = "\U0001F43E"
-        bbox = draw.textbbox((0, 0), paw, font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        x = (size - tw) // 2 - bbox[0]
-        y = (size - th) // 2 - bbox[1] + 2
-        draw.text((x, y), paw, font=font, embedded_color=True)
-    except (OSError, AttributeError):
+        try:
+            bbox = draw.textbbox((0, 0), paw, font=efont)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            x = (size - tw) // 2 - bbox[0]
+            y = (size - th) // 2 - bbox[1] + 2
+            draw.text((x, y), paw, font=efont, embedded_color=True)
+        except (OSError, AttributeError):
+            draw.ellipse([24, 24, 72, 72], fill=(180, 140, 100, 200))
+    else:
         draw.ellipse([24, 24, 72, 72], fill=(180, 140, 100, 200))
     ring_w = 5
     draw.ellipse([cx - r, cy - r, cx + r, cy + r],
@@ -1559,13 +1596,7 @@ def _build_paw_overlay():
 
 def _build_censored_overlay():
     """Render 'CENSORED' red stamp overlay as BGRA numpy array."""
-    try:
-        font = ImageFont.truetype("segoeuib.ttf", 30)
-    except OSError:
-        try:
-            font = ImageFont.truetype("arialbd.ttf", 30)
-        except OSError:
-            font = ImageFont.load_default()
+    font = _find_font(30, bold=True)
     tmp = Image.new("RGBA", (1, 1))
     draw = ImageDraw.Draw(tmp)
     bbox = draw.textbbox((0, 0), "CENSORED", font=font)
@@ -1574,9 +1605,7 @@ def _build_censored_overlay():
     w, h = tw + pad_x * 2, th + pad_y * 2
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    # Red border rectangle (stamp look)
     draw.rectangle([0, 0, w - 1, h - 1], outline=(233, 69, 96, 220), width=3)
-    # Red text
     draw.text((pad_x - bbox[0], pad_y - bbox[1]), "CENSORED", font=font,
               fill=(233, 69, 96, 220))
     arr = np.array(img)
@@ -1596,13 +1625,7 @@ def _build_shield_overlay():
     draw.polygon(shield_points, fill=(15, 15, 35, 200), outline=(233, 69, 96, 240))
     inset = [(int(48 + (x-48)*0.92), int(48 + (y-48)*0.92)) for x, y in shield_points]
     draw.polygon(inset, outline=(233, 69, 96, 180))
-    try:
-        font = ImageFont.truetype("segoeuib.ttf", 32)
-    except OSError:
-        try:
-            font = ImageFont.truetype("arialbd.ttf", 32)
-        except OSError:
-            font = ImageFont.load_default()
+    font = _find_font(32, bold=True)
     bbox = draw.textbbox((0, 0), "NA", font=font)
     tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
     draw.text((48 - tw//2 - bbox[0], 40 - th//2 - bbox[1]), "NA", font=font, fill=(255, 255, 255, 240))
@@ -1613,13 +1636,7 @@ def _build_shield_overlay():
 
 def _build_tvrating_overlay():
     """Render 'TV-NA' rating badge as BGRA numpy array."""
-    try:
-        font = ImageFont.truetype("segoeuib.ttf", 20)
-    except OSError:
-        try:
-            font = ImageFont.truetype("arialbd.ttf", 20)
-        except OSError:
-            font = ImageFont.load_default()
+    font = _find_font(20, bold=True)
     tmp = Image.new("RGBA", (1, 1))
     d = ImageDraw.Draw(tmp)
     bbox = d.textbbox((0, 0), "TV-NA", font=font)
@@ -1640,13 +1657,7 @@ def _build_tvrating_overlay():
 
 def _build_cleanstream_overlay():
     """Render 'CLEAN STREAM' two-line badge as BGRA numpy array."""
-    try:
-        font = ImageFont.truetype("segoeuib.ttf", 18)
-    except OSError:
-        try:
-            font = ImageFont.truetype("arialbd.ttf", 18)
-        except OSError:
-            font = ImageFont.load_default()
+    font = _find_font(18, bold=True)
     tmp = Image.new("RGBA", (1, 1))
     d = ImageDraw.Draw(tmp)
     bbox1 = d.textbbox((0, 0), "CLEAN", font=font)
@@ -1697,13 +1708,7 @@ def _build_filmstrip_overlay():
         draw.rounded_rectangle([x, h-11, x+8, h-3], radius=2, outline=(160, 160, 180, 180))
     draw.line([(0, 12), (w, 12)], fill=(160, 160, 180, 160), width=1)
     draw.line([(0, h-12), (w, h-12)], fill=(160, 160, 180, 160), width=1)
-    try:
-        font_na = ImageFont.truetype("segoeuib.ttf", 16)
-    except OSError:
-        try:
-            font_na = ImageFont.truetype("arialbd.ttf", 16)
-        except OSError:
-            font_na = ImageFont.load_default()
+    font_na = _find_font(16, bold=True)
     bbox = draw.textbbox((0, 0), "NoAnimals", font=font_na)
     tw_full = bbox[2]-bbox[0]
     th_full = bbox[3]-bbox[1]
@@ -1724,15 +1729,18 @@ def _build_nocat_overlay():
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     cx, cy, r = size // 2, size // 2, 42
-    try:
-        efont = ImageFont.truetype("seguiemj.ttf", 52)
+    efont = _find_emoji_font(52)
+    if efont:
         cat = "\U0001F408"
-        bbox = draw.textbbox((0, 0), cat, font=efont)
-        tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
-        x = (size - tw)//2 - bbox[0]
-        y = (size - th)//2 - bbox[1] + 2
-        draw.text((x, y), cat, font=efont, embedded_color=True)
-    except (OSError, AttributeError):
+        try:
+            bbox = draw.textbbox((0, 0), cat, font=efont)
+            tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
+            x = (size - tw)//2 - bbox[0]
+            y = (size - th)//2 - bbox[1] + 2
+            draw.text((x, y), cat, font=efont, embedded_color=True)
+        except (OSError, AttributeError):
+            draw.ellipse([24, 24, 72, 72], fill=(180, 160, 140, 200))
+    else:
         draw.ellipse([24, 24, 72, 72], fill=(180, 160, 140, 200))
     ring_w = 5
     draw.ellipse([cx-r, cy-r, cx+r, cy+r], outline=(233, 69, 96, 230), width=ring_w)
@@ -1745,20 +1753,8 @@ def _build_nocat_overlay():
 
 def _build_poweredby_overlay():
     """Render 'Powered by NoAnimals' tag as BGRA numpy array."""
-    try:
-        font_sm = ImageFont.truetype("segoeui.ttf", 13)
-    except OSError:
-        try:
-            font_sm = ImageFont.truetype("arial.ttf", 13)
-        except OSError:
-            font_sm = ImageFont.load_default()
-    try:
-        font_brand = ImageFont.truetype("segoeuib.ttf", 16)
-    except OSError:
-        try:
-            font_brand = ImageFont.truetype("arialbd.ttf", 16)
-        except OSError:
-            font_brand = ImageFont.load_default()
+    font_sm = _find_font(13, bold=False)
+    font_brand = _find_font(16, bold=True)
     tmp = Image.new("RGBA", (1, 1))
     d = ImageDraw.Draw(tmp)
     pb_bbox = d.textbbox((0, 0), "Powered by ", font=font_sm)
@@ -1802,13 +1798,7 @@ def _build_eyeslash_overlay():
 
 def _build_filtered_overlay():
     """Render 'FILTERED' green stamp as BGRA numpy array."""
-    try:
-        font = ImageFont.truetype("segoeuib.ttf", 24)
-    except OSError:
-        try:
-            font = ImageFont.truetype("arialbd.ttf", 24)
-        except OSError:
-            font = ImageFont.load_default()
+    font = _find_font(24, bold=True)
     tmp = Image.new("RGBA", (1, 1))
     d = ImageDraw.Draw(tmp)
     bbox = d.textbbox((0, 0), "FILTERED", font=font)
@@ -1831,15 +1821,18 @@ def _build_nohorse_overlay():
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     cx, cy, r = size // 2, size // 2, 42
-    try:
-        efont = ImageFont.truetype("seguiemj.ttf", 52)
+    efont = _find_emoji_font(52)
+    if efont:
         horse = "\U0001F434"
-        bbox = draw.textbbox((0, 0), horse, font=efont)
-        tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
-        x = (size - tw)//2 - bbox[0]
-        y = (size - th)//2 - bbox[1]
-        draw.text((x, y), horse, font=efont, embedded_color=True)
-    except (OSError, AttributeError):
+        try:
+            bbox = draw.textbbox((0, 0), horse, font=efont)
+            tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
+            x = (size - tw)//2 - bbox[0]
+            y = (size - th)//2 - bbox[1]
+            draw.text((x, y), horse, font=efont, embedded_color=True)
+        except (OSError, AttributeError):
+            draw.ellipse([24, 24, 72, 72], fill=(180, 140, 100, 200))
+    else:
         draw.ellipse([24, 24, 72, 72], fill=(180, 140, 100, 200))
     ring_w = 5
     draw.ellipse([cx-r, cy-r, cx+r, cy+r], outline=(233, 69, 96, 230), width=ring_w)
@@ -1853,7 +1846,7 @@ def _build_nohorse_overlay():
 def _overlay_to_png_b64(overlay_bgra):
     """Convert a BGRA numpy overlay to a base64-encoded PNG data URI."""
     rgba = overlay_bgra.copy()
-    rgba[:, :, :3] = rgba[:, :, 2::-1]  # BGRA -> RGBA
+    rgba[:, :, :3] = rgba[:, :, 2::-1]
     img = Image.fromarray(rgba, "RGBA")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -1866,7 +1859,7 @@ def _load_png_overlay(filename, size=120):
     img = Image.open(path).convert("RGBA")
     img = img.resize((size, size), Image.LANCZOS)
     arr = np.array(img)
-    arr[:, :, :3] = arr[:, :, 2::-1]  # RGBA -> BGRA
+    arr[:, :, :3] = arr[:, :, 2::-1]
     return arr
 
 
@@ -1934,7 +1927,6 @@ def client_watchdog():
     """Background thread: stop streams with no client requests for CLIENT_TIMEOUT seconds."""
     while True:
         time.sleep(5)
-        # Live streams
         with streams_lock:
             stream_list = list(streams.values())
         for stream in stream_list:
@@ -1948,7 +1940,6 @@ def client_watchdog():
                 with stream.stats_lock:
                     stream.stats["status"] = "listening"
                 stream.last_client_request = 0.0
-        # VOD pipelines
         with vod_lock:
             vod_list = list(vod_active.items())
         for xui_id, vod_inst in vod_list:
@@ -1966,11 +1957,11 @@ def client_watchdog():
 # ---------------------------------------------------------------------------
 
 app = Flask(__name__)
-
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAE8klEQVR4nHVWO48cRRCu6u6Znn3v3u7t+QUXYPgBCPEDCECOcEBCQE5AQIb4BSCRGCECMhMTIIcWQpAgRICEhITBQoCxjffOt+fZx+3s7ExXoZ7HzuP2Wivt9HR3VX31fVXTOBwfwkWDGQABuPQqmSIW7zDdCbvfA4gLrZd31QbveoVYnCidU5UzNYPZNPnj3MQWVXlzulTYKqY5AtwRLpMd50wkeUAgIt6uVjBVDF2YIiZqtNqd7qDwUQqFyHS6g2a7m/nAC7OXO+D6GgMLIQejg05vj8iUl6z13t5gdCCl2kFHNVs5B+cIEEIuFzNE0R+OEWHuTxFtNMzU6Q0Hw/Hs2dPF7FSIag5q9CCofM7JQ7bCTHaCOPenzNQfHgDAarkAgGar090b+dPjmX8ihGBODloV2QOZB84VZRFUA2dmIYTjeFtZrders8Ws2xu22j0AkEqtlvNgtfS8Zq1A4jgmilOgxfvh/vM5LmQiV3uD0SUhpY0fRQqJKAlpiw9YADIzWaBZXIBIxjw7OdqEAaZ5s3VqEZQKBKDTHyrHYaJNGERhSGRqKrJZEEKgUK7WFgQDcxI1K8fp9PemR4+LvZaDUnbsycT5cu6j4/QuX9XNtus1lOOilIl22cRRtA7C4Gz2dDL3Tzr9ISJuwoCZdKMlhLThp7wmQddUxIgYbzYgxcuv39SNVsJ2xk22K0OMJtr8fPfrKFwrx53PTploIB27mnWwNJeo0kwVbQFFtFm3enuO1wiDZY2xLQdA7DZb3eF49uRRAtEBBiGlySpmC4FVmqmiwwCQMUpru25Jtskt95fkAUEkBLouGSOE7PaGqcBMGBdNJdkqSv0vY5uIlKOtqLZSyA9tdZk+SOWwHTT3p3N/msgh74y5zYSQyrBAUp2VKoR3dNtEmogghZSJrKsxpLnkeqGVQyxpAUrFn3GOQriOG8RxHKxkoz3QGlBEdRtlFeWvEQXFcSVeTD9VGQwGlsoJV2d//nV/P1q/FMwnUfSbT6O9fdemZMsX7nLAts1Fm5CJis8fZ48pK5jU/E/f3HknCt584frcmL4UD4Pgw8nxqtMXQmRkJF7Oq5CllJtgJaTcdkq2XSEfRK6r79375Y3V/OPrL/5wdnbjn3/fevBoIdStq5d9f1oPtzJDJGJHe2f+6eTv+yaOEVEqR7na1Z6jPVd7ytWGOfzv4dvj8buPHr/aaHx0MJ7E8QdPJvuufkW7izjOWtg5DjL+UMhGs/3Hj987WivXU1pL5UgpE/eG4jhYr5U/bR8+9+3x9LvF8qvnrzUEvv/k6CiOLzlOXLZX+eDYrknhOnB1Q3tNr9E0UWTImCCIaZm3Clt8nnKOAedRfKPT/uzpyc0HD7+4evnzK5dGUv6+Xuu0gHLWSrcKBIG4mJ0CgKu91BgACKlQFXGwVQEKx/30+PjW4SEC3F0uv/Rnt69d+WRy9Otq1ZWykAcgZhev4uZkBwA4ri3maBPCriERF0SvdTvvjcdtqSKmO8/82ycneecp5b1wUK24pOvasdNBqr8FEQKMlDojWhrTkdKmvWyqxkHZExtTiYbr7Y4AOomOF8ZIxL5UJu8otTjSgLeRF9mrIsLiopevUPJTyU6z60KZOODd96LMGZcRbDGWjqSXinIC6g4uuODuOJN/0wr3ldt1ZXE7rVZyGUoZ03lw6WoKcbt/V0z/AxwhbXvEa9WCAAAAAElFTkSuQmCC">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>NoAnimals - Stream Server</title>
 <style>
@@ -2121,13 +2112,13 @@ No channels discovered yet. Configure M3U source below and click Fetch Now.
 <div class="row"><label>Smooth Window</label><input type="range" id="smooth" min="1" max="15" step="1" value="5"><span class="val" id="smoothVal">5</span></div>
 <div class="setting-desc">Frames to average box position over. Higher = steadier boxes, slower to react.</div>
 <div class="row"><label>YOLO Model</label><select id="model">
-<option value="yolov8n.pt">yolov8n (fast)</option>
-<option value="yolov8s.pt">yolov8s (balanced)</option>
-<option value="yolov8m.pt">yolov8m</option>
-<option value="yolov8l.pt">yolov8l</option>
-<option value="yolov8x.pt" selected>yolov8x (accurate)</option>
+<option value="yolov8n_openvino_model">yolov8n (fast)</option>
+<option value="yolov8s_openvino_model" selected>yolov8s (balanced)</option>
+<option value="yolov8m_openvino_model">yolov8m (accurate)</option>
+<option value="yolov8l_openvino_model">yolov8l (heavy)</option>
+<option value="yolov8x_openvino_model">yolov8x (max accuracy)</option>
 </select></div>
-<div class="setting-desc">YOLOv8 model size. Larger = more accurate but uses more GPU.</div>
+<div class="setting-desc">YOLOv8 model size (OpenVINO). Larger = more accurate but uses more CPU. Export with export_model.py first.</div>
 <div class="row"><label>Censor Style</label><select id="censorMode">
 <option value="black">Black box</option>
 <option value="blur">Blur</option>
@@ -2332,8 +2323,6 @@ function removeChannel(slug){post('/api/channel/remove/'+slug,{}).catch(()=>{})}
 function readdChannel(slug){post('/api/channel/add/'+slug,{}).catch(()=>{})}
 </script>
 </body></html>"""
-
-
 @app.route("/")
 def index():
     return Response(DASHBOARD_HTML, content_type="text/html")

@@ -4,7 +4,11 @@ on:
   push:
     branches: [master]
     paths:
-      - 'docker/**'
+      - 'Dockerfile'
+      - 'stream_animals_v3.py'
+      - 'censor_animals.py'
+      - 'export_model.py'
+      - 'requirements.txt'
       - '.github/workflows/docker.yml'
   workflow_dispatch:
 
@@ -42,7 +46,7 @@ jobs:
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
-          context: docker
+          context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

@@ -24,7 +24,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy overlay PNGs from parent project
+# Copy overlay PNGs
 COPY overlay_*.png ./
 
 # Copy application code
@@ -34,7 +34,7 @@ COPY export_model.py stream_animals_v3.py censor_animals.py ./
 RUN python export_model.py --model yolov8s.pt
 
 # Unraid icon
-LABEL net.unraid.docker.icon="https://raw.githubusercontent.com/jcramer83/no-animals/master/docker/icon.png"
+LABEL net.unraid.docker.icon="https://raw.githubusercontent.com/jcramer83/no-animals/master/icon.png"
 
 EXPOSE 8080
 
