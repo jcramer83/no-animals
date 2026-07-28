@@ -27,6 +27,29 @@ docker run -d --name noanimals \
 
 Image is built automatically by GitHub Actions on push to master. Pushed to `ghcr.io/jcramer83/no-animals:latest`. Image bundles YOLOv8s (OpenVINO format). See `README.md` for Unraid-specific setup.
 
+## Development
+
+No local dev environment — all development targets Docker. No tests, no linter.
+
+```bash
+# Build locally
+docker build -t noanimals .
+
+# Run locally (Intel iGPU)
+docker run -d --name noanimals -p 8080:8080 --device /dev/dri:/dev/dri --group-add video \
+  -v ./data:/app/data -e M3U_URL="https://..." noanimals
+
+# View logs
+docker logs -f noanimals
+
+# Shell into running container
+docker exec -it noanimals bash
+```
+
+**CI/CD trigger paths**: The GitHub Actions workflow (`.github/workflows/docker.yml`) only triggers on changes to `Dockerfile`, `stream_animals_v3.py`, `censor_animals.py`, `export_model.py`, `requirements.txt`, or the workflow file itself. Changes to other files (CLAUDE.md, README, overlays, icon) do NOT trigger a rebuild. Use `workflow_dispatch` for manual triggers.
+
+**M3U provider**: Default provider is hivecast.cc (Xtream Codes panel). VOD URLs use `/play/<token>#.ext` format — the `#.ext` fragment is stripped during M3U parsing, leaving the bare token URL. These are static tokens (not session-based), but the backend files may go offline independently of the M3U listing.
+
 ## Architecture
 
 ### Batch Pipeline (`censor_animals.py`)
@@ -112,7 +135,7 @@ Five modes, all with rounded-corner masks (radius scales with box size):
 
 ### Overlay System
 
-18 options, pre-rendered as BGRA numpy arrays at module load (zero per-frame PIL cost):
+19 options, pre-rendered as BGRA numpy arrays at module load (zero per-frame PIL cost):
 - **none**, **text** ("NoAnimals"), **graphic** (dog emoji + prohibition), **petfree** ("PET FREE TV" badge), **paw** (paw + prohibition), **censored** (red stamp), **shield** ("NA" monogram), **tvrating** ("TV-NA" badge), **cleanstream** ("CLEAN STREAM"), **lock** (padlock + checkmark), **filmstrip** (film frame + branding), **nocat** (cat + prohibition), **poweredby** ("Powered by NoAnimals"), **eyeslash** (eye with slash), **filtered** ("FILTERED" green stamp), **nohorse** (horse + prohibition), **nodog** (PNG overlay), **nopaw** (PNG overlay), **animalfree** (PNG overlay)
 
 Applied via `apply_overlay()` using alpha compositing. Live streams: bottom-left (16px margin, adjusted for `pad_y` letterbox). VOD: bottom-left, 180px from bottom edge to clear widescreen letterbox bars.
