@@ -163,7 +163,10 @@ Applied via `apply_overlay()` using alpha compositing. Live streams: bottom-left
 
 ## Known Constraints
 
-- **FFmpeg quirks**: `-live_start_index` does not exist in FFmpeg 8.0.1. Avoid it.
+- **FFmpeg version**: The container runs Debian bookworm's FFmpeg **5.1.x** (verified 5.1.9), not 8.x. Check option availability against 5.1 docs, not the latest.
+- **`-live_start_index` DOES exist** (verified in the running container's 5.1.9, default `-3`). It is an HLS *demuxer* option, so it must be placed **before** `-i` — putting it after is the usual reason it appears to be rejected. An earlier version of this file claimed the option was absent; that was wrong.
+- **A/V sync depends on symmetric CFR handling**: Audio and video reach the encoder as headerless raw streams (`s16le` / `rawvideo`) with no timestamps, so the encoder derives PTS purely from counts — `samples/48000` and `frames/fps`. Sync holds *only* while both paths deliver equal content time. The decoder's video output is CFR-padded by the `fps` filter, so the audio output **must** keep its `aresample=async=1:first_pts=0` counterpart (`AUDIO_CFR_FILTER`). Without it, any source gap — splice, decode hiccup, HLS live-edge skip — silently drops samples and the offset accumulates permanently. Do not remove it.
+- **The `fps` stat is bursty by construction — don't chase it**: `stats["fps"]` is measured over 30-frame windows, but HLS delivers in 4-second segments, so Python receives a ~120-frame burst then idles. Instantaneous readings swing wildly (observed 9 → 88 fps on a healthy stream) while the *average* sits at target. Judge pipeline health by `frames_processed / uptime`, not the displayed fps. Also expect >1x realtime for the first minute or two after start, while the decoder drains the provider's DVR backlog; it settles to ~1.0x on its own.
 - **Dashboard HTML is embedded** in `stream_animals_v3.py` as `DASHBOARD_HTML` string. Changes require server restart.
 - **Resolution fixed at compile time**: `W, H = 1920, 1080` is a module-level constant.
 - **VOD codec auto-detect**: VOD omits hardcoded decoder so FFmpeg auto-selects the right decoder. Live streams hardcode h264.
