@@ -206,6 +206,16 @@ def slugify(name):
     return s.strip('-')
 
 
+def _parse_rate(rate_str):
+    """Parse an ffprobe 'num/den' rate string. Returns 0.0 if absent or degenerate."""
+    try:
+        num, den = rate_str.split("/")
+        num, den = int(num), int(den)
+        return num / den if num > 0 and den > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
 def probe_stream(url):
     """Get source fps, audio presence, video dimensions, and duration."""
     print(f"[probe] probing URL: {url[:120]}...", flush=True)
@@ -216,10 +226,10 @@ def probe_stream(url):
         info = json.loads(r.stdout)
         vs = next(s for s in info["streams"] if s["codec_type"] == "video")
         # Prefer avg_frame_rate (actual content fps) over r_frame_rate
-        # (which reports field rate for interlaced, e.g. 59.94 instead of 29.97)
-        fps_str = vs.get("avg_frame_rate") or vs["r_frame_rate"]
-        num, den = fps_str.split("/")
-        fps = int(num) / max(int(den), 1)
+        # (which reports field rate for interlaced, e.g. 59.94 instead of 29.97).
+        # Live HLS often reports avg_frame_rate as "0/0" — fall back rather than
+        # letting fps collapse to 0 (which would floor target_fps at 15).
+        fps = _parse_rate(vs.get("avg_frame_rate", "")) or _parse_rate(vs.get("r_frame_rate", "")) or FPS
         has_audio = any(s["codec_type"] == "audio" for s in info["streams"])
         src_w = int(vs.get("width", 0))
         src_h = int(vs.get("height", 0))
@@ -353,6 +363,17 @@ def _build_decoder_vf(hwaccel, fps=None):
     if hwaccel == "vaapi":
         return f"scale_vaapi=w={W}:h={H},hwdownload,format=nv12,fps={_fps:.2f}"
     return f"fps={_fps:.2f},scale={W}:{H}"
+
+
+# Audio counterpart to the video `fps` filter. Both raw streams reach the encoder
+# without timestamps, so it derives PTS from counts alone (samples/48000 and
+# frames/fps). Sync therefore holds only while both paths deliver the same amount
+# of content time. The `fps` filter already pads video across source gaps by
+# duplicating frames; without this, a gap in the source audio just loses samples
+# and the offset accumulates permanently. `async=1` fills gaps with silence and
+# trims overlaps; `first_pts=0` pads an initially-late audio track instead of
+# letting it start early against the video.
+AUDIO_CFR_FILTER = "aresample=async=1:first_pts=0"
 
 
 # ---------------------------------------------------------------------------
@@ -692,7 +713,9 @@ class StreamInstance:
         if has_audio:
             audio_idx = probe.get("eng_audio_idx", 0) if self.is_vod else 0
             dec_cmd += [
-                "-map", f"0:a:{audio_idx}", "-f", "s16le", "-ar", "48000", "-ac", "2",
+                "-map", f"0:a:{audio_idx}",
+                "-af", AUDIO_CFR_FILTER,
+                "-f", "s16le", "-ar", "48000", "-ac", "2",
                 f"tcp://127.0.0.1:{self.a_port}",
             ]
         print(f"[{tag}] decoder: {' '.join(dec_cmd)}", flush=True)
@@ -1082,7 +1105,9 @@ class StreamInstance:
         if has_audio:
             audio_idx = probe.get("eng_audio_idx", 0) if self.is_vod else 0
             dec_cmd += [
-                "-map", f"0:a:{audio_idx}", "-f", "s16le", "-ar", "48000", "-ac", "2",
+                "-map", f"0:a:{audio_idx}",
+                "-af", AUDIO_CFR_FILTER,
+                "-f", "s16le", "-ar", "48000", "-ac", "2",
                 f"tcp://127.0.0.1:{self.a_port}",
             ]
         print(f"[{tag}] decoder: {' '.join(dec_cmd)}", flush=True)
