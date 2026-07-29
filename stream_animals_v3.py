@@ -440,11 +440,16 @@ _default_config = {
     "confidence": 0.25,
     "padding": 30,
     "model": "yolov8m_openvino_model",
-    "persist_frames": 2,
+    # Holds boxes across the frames we skip between detections. Must comfortably
+    # exceed detect_every or boxes flicker on and off.
+    "persist_frames": 12,
     "smooth_window": 5,
     "overlay": "text",
     "censor_mode": "pixelate",
-    "detect_every": 2,
+    # Do NOT lower this to 2 while defaulting to yolov8m at 640 — measured on an
+    # i9-13900K, that pairing runs at 0.69x realtime, which drains the 32s HLS
+    # window and freezes players. At 4 the same hardware sustains >=1.2x.
+    "detect_every": 4,
     "channel_filters": ["hallmark"],
     "excluded_channels": [],
 }
