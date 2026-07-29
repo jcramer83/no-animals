@@ -74,8 +74,9 @@ HEALTH_WINDOW = 60        # seconds of history behind the rate estimate
 HEALTH_MIN_RATIO = 0.85   # sustained below this = falling behind
 HEALTH_GRACE = 90         # skip judgement this long after a pipeline starts
 HEALTH_MAX_RESTARTS = 3   # per rolling hour, then stop trying and report
-HEALTH_STRIKES = 3        # consecutive failing checks before acting (~30s)
-HEALTH_CRITICAL_RATIO = 0.35  # this far below realtime, act on the first check
+HEALTH_STRIKES = 6        # consecutive failing checks before acting (~60s)
+HEALTH_RECENT = 30        # short window that must ALSO be bad, so a pipeline
+                          # already recovering is never restarted
 HEALTH_TICK = 10          # watchdog cadence; also the sampling interval
 
 MAX_STREAMS = 10
@@ -607,8 +608,8 @@ class StreamInstance:
         cutoff = time.time() - 15
         return sum(1 for t in self.client_ips.values() if t > cutoff)
 
-    def health_ratio(self):
-        """Content produced per second of wall clock over the recent window.
+    def health_ratio(self, window=None):
+        """Content produced per second of wall clock over a trailing window.
 
         1.0 means keeping pace with realtime, >1 means catching up on the
         source's DVR backlog, <1 means losing ground. Deliberately computed
@@ -618,15 +619,16 @@ class StreamInstance:
 
         Returns None while there is too little history to judge.
         """
+        span = window or HEALTH_WINDOW
         if len(self._health) < 2:
             return None
         now = time.time()
-        recent = [s for s in self._health if s[0] >= now - HEALTH_WINDOW]
+        recent = [s for s in self._health if s[0] >= now - span]
         if len(recent) < 2:
             return None
         (t0, f0), (t1, f1) = recent[0], recent[-1]
         dt = t1 - t0
-        if dt < HEALTH_WINDOW * 0.5:
+        if dt < span * 0.4:
             return None
         target = self.target_fps or FPS
         return ((f1 - f0) / dt) / target
@@ -2096,17 +2098,22 @@ def health_watchdog():
             # Nothing watching: the client watchdog will stop it shortly anyway.
             if s.active_client_count == 0:
                 continue
-            if ratio is None or ratio >= HEALTH_MIN_RATIO:
+            # The short window must be bad too. Providers stall for 30-45s and
+            # then recover with a catch-up burst; the long window stays depressed
+            # for a minute afterwards, so triggering on it alone restarts
+            # pipelines that are already fixing themselves.
+            recent_ratio = s.health_ratio(HEALTH_RECENT)
+            healthy = (ratio is None or ratio >= HEALTH_MIN_RATIO
+                       or (recent_ratio is not None and recent_ratio >= HEALTH_MIN_RATIO))
+            if healthy:
                 s._health_strikes = 0
                 continue
-            # Require the deficit to persist, unless it is catastrophic — a
-            # brief source stall can drag the rolling window under the floor
-            # without the pipeline being sick.
+            # Require the deficit to persist longer than an observed provider
+            # stall, so only a pipeline that is genuinely stuck gets restarted.
             s._health_strikes += 1
-            needed = 1 if ratio < HEALTH_CRITICAL_RATIO else HEALTH_STRIKES
-            if s._health_strikes < needed:
+            if s._health_strikes < HEALTH_STRIKES:
                 print(f"[health] [{s.slug}] {ratio:.2f}x realtime "
-                      f"(strike {s._health_strikes}/{needed})", flush=True)
+                      f"(strike {s._health_strikes}/{HEALTH_STRIKES})", flush=True)
                 continue
 
             now = time.time()
