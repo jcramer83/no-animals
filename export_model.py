@@ -13,12 +13,12 @@ from ultralytics import YOLO
 
 def main():
     parser = argparse.ArgumentParser(description="Export YOLO model to OpenVINO IR format")
-    parser.add_argument("--model", "-m", default="yolov8x.pt",
-                        help="YOLO model to export (default: yolov8x.pt)")
+    parser.add_argument("--model", "-m", default="yolov8m.pt",
+                        help="YOLO model to export (default: yolov8m.pt)")
     parser.add_argument("--half", action="store_true",
                         help="Export with FP16 precision (smaller, faster on iGPU)")
-    parser.add_argument("--imgsz", type=int, default=480,
-                        help="Input image size (default: 480)")
+    parser.add_argument("--imgsz", type=int, default=640,
+                        help="Input image size (default: 640, must match DETECT_IMGSZ)")
     args = parser.parse_args()
 
     print(f"Loading model: {args.model}")

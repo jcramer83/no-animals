@@ -30,9 +30,15 @@ COPY overlay_*.png ./
 # Copy application code
 COPY export_model.py stream_animals_v3.py censor_animals.py ./
 
-# Pre-export YOLO models to OpenVINO format so they're ready at first boot
-RUN python export_model.py --model yolov8n.pt && \
-    python export_model.py --model yolov8s.pt
+# Pre-export YOLO models to OpenVINO format so they're ready at first boot.
+# imgsz must match DETECT_IMGSZ in stream_animals_v3.py — OpenVINO bakes the
+# input shape into the IR, so a mismatch silently wastes the larger size.
+# Every model offered in the dashboard dropdown must be exported here or
+# selecting it crashes the app with FileNotFoundError.
+RUN python export_model.py --model yolov8n.pt --imgsz 640 && \
+    python export_model.py --model yolov8s.pt --imgsz 640 && \
+    python export_model.py --model yolov8m.pt --imgsz 640 && \
+    python export_model.py --model yolov8l.pt --imgsz 640
 
 # Unraid icon
 LABEL net.unraid.docker.icon="https://raw.githubusercontent.com/jcramer83/no-animals/master/icon.png"

@@ -51,6 +51,19 @@ ANIMAL_CLASS_NAMES = {
     19: "cow", 20: "elephant", 21: "bear", 22: "zebra", 23: "giraffe",
 }
 
+# YOLO inference resolution. Must match the imgsz the OpenVINO IR was exported
+# at — OpenVINO bakes in a fixed input shape, so changing this alone does
+# nothing; the model has to be re-exported too (see Dockerfile).
+DETECT_IMGSZ = 640
+
+# Censoring strength. Fewer blocks = coarser = more obscured. Real broadcast
+# frames showed animals still readable at 8+ blocks, so this sits below that;
+# the flood toward the region average knocks down the remaining contrast.
+PIXELATE_BLOCKS = 6
+PIXELATE_FLOOD = 0.35
+
+CENSOR_MODES = ("black", "pixelate", "blur")
+
 MAX_STREAMS = 10
 MAX_VOD_PIPELINES = 3
 VOD_PORT_BASE = 19976       # well above live range 19876-19898
@@ -158,6 +171,46 @@ def rounded_rect_mask(h, w, radius):
     mask[h-r:, :r] = corner[::-1, :]
     mask[h-r:, w-r:] = corner[::-1, ::-1]
     return mask
+
+
+def _censor_fill(roi, mode):
+    """Return replacement pixels for a censored region (same shape as roi).
+
+    Three modes only. `black` is the guaranteed floor; `pixelate` and `blur`
+    trade a softer look for obscuration and must stay aggressive enough that
+    the animal is not identifiable — verified against real broadcast frames,
+    where finer settings (12+ blocks, light blurs) left animals readable.
+    """
+    rh, rw = roi.shape[:2]
+
+    if mode == "pixelate":
+        # Coarse square cells with hard edges — a classic broadcast mosaic.
+        # The grid comes off the longer edge so cells stay square whatever the
+        # region's aspect. INTER_AREA averages honestly on the way down (this
+        # is what destroys the detail); INTER_NEAREST keeps the block edges
+        # crisp on the way up instead of smearing them back into a soft blur.
+        longer = max(rh, rw)
+        gw = max(1, round(rw / longer * PIXELATE_BLOCKS))
+        gh = max(1, round(rh / longer * PIXELATE_BLOCKS))
+        small = cv2.resize(roi, (gw, gh), interpolation=cv2.INTER_AREA)
+        avg = small.mean(axis=(0, 1)).astype(np.float32)
+        small = (small.astype(np.float32) * (1 - PIXELATE_FLOOD)
+                 + avg * PIXELATE_FLOOD).astype(np.uint8)
+        return cv2.resize(small, (rw, rh), interpolation=cv2.INTER_NEAREST)
+
+    if mode == "blur":
+        # The 1/40 downscale is what actually destroys the information; the
+        # Gaussian only smooths the resulting blocks and the flood toward the
+        # region average removes what is left of the silhouette.
+        tiny = cv2.resize(roi, (max(1, rw // 40), max(1, rh // 40)),
+                          interpolation=cv2.INTER_AREA)
+        out = cv2.resize(tiny, (rw, rh), interpolation=cv2.INTER_LINEAR)
+        ksize = max(51, (min(rh, rw) // 3) | 1)
+        out = cv2.GaussianBlur(out, (ksize, ksize), 0)
+        avg = out.mean(axis=(0, 1)).astype(np.float32)
+        return (out.astype(np.float32) * 0.3 + avg * 0.7).astype(np.uint8)
+
+    return np.zeros_like(roi)
 
 
 class BoxTracker:
@@ -384,9 +437,9 @@ SETTINGS_FILE = Path(__file__).parent / "data" / "noanimals_settings.json"
 
 config_lock = threading.Lock()
 _default_config = {
-    "confidence": 0.4,
+    "confidence": 0.25,
     "padding": 30,
-    "model": "yolov8s_openvino_model",
+    "model": "yolov8m_openvino_model",
     "persist_frames": 2,
     "smooth_window": 5,
     "overlay": "text",
@@ -407,6 +460,15 @@ def _load_config():
             for k in _default_config:
                 if k in saved:
                     cfg[k] = saved[k]
+            # Migrate censor modes that no longer exist — a stale settings file
+            # would otherwise silently fall through to black.
+            _retired = {"fine_blur": "blur", "color_match": "black"}
+            if cfg.get("censor_mode") in _retired:
+                old = cfg["censor_mode"]
+                cfg["censor_mode"] = _retired[old]
+                print(f"[config] censor mode '{old}' retired, using '{cfg['censor_mode']}'", flush=True)
+            if cfg.get("censor_mode") not in CENSOR_MODES:
+                cfg["censor_mode"] = _default_config["censor_mode"]
             print(f"[config] loaded settings from {SETTINGS_FILE}", flush=True)
     except Exception as e:
         print(f"[config] failed to load settings: {e}", flush=True)
@@ -832,7 +894,7 @@ class StreamInstance:
             if frame_count % detect_every == 0:
                 results = model.predict(frame, conf=conf, verbose=False,
                                         classes=list(ANIMAL_CLASS_IDS),
-                                        imgsz=480)
+                                        imgsz=DETECT_IMGSZ)
                 raw_boxes = []
                 raw_classes = []
                 for r in results:
@@ -864,37 +926,8 @@ class StreamInstance:
                 roi = frame[y1c:y2c, x1c:x2c]
                 radius = max(12, min(rh, rw) // 6)
                 mask = rounded_rect_mask(rh, rw, radius)[:, :, None]
-                if censor_mode == "blur":
-                    tiny = cv2.resize(roi, (max(1, rw // 40), max(1, rh // 40)),
-                                      interpolation=cv2.INTER_AREA)
-                    blurred = cv2.resize(tiny, (rw, rh), interpolation=cv2.INTER_LINEAR)
-                    ksize = max(51, (min(rh, rw) // 3) | 1)
-                    blurred = cv2.GaussianBlur(blurred, (ksize, ksize), 0)
-                    avg = blurred.mean(axis=(0, 1)).astype(np.float32)
-                    blurred = (blurred.astype(np.float32) * 0.3 + avg * 0.7).astype(np.uint8)
-                    frame[y1c:y2c, x1c:x2c] = (roi * (1 - mask) + blurred * mask).astype(np.uint8)
-                elif censor_mode == "fine_blur":
-                    tiny = cv2.resize(roi, (max(1, rw // 12), max(1, rh // 12)),
-                                      interpolation=cv2.INTER_AREA)
-                    blurred = cv2.resize(tiny, (rw, rh), interpolation=cv2.INTER_LINEAR)
-                    ksize = max(31, (min(rh, rw) // 5) | 1)
-                    blurred = cv2.GaussianBlur(blurred, (ksize, ksize), 0)
-                    avg = blurred.mean(axis=(0, 1)).astype(np.float32)
-                    blurred = (blurred.astype(np.float32) * 0.5 + avg * 0.5).astype(np.uint8)
-                    frame[y1c:y2c, x1c:x2c] = (roi * (1 - mask) + blurred * mask).astype(np.uint8)
-                elif censor_mode == "pixelate":
-                    small = cv2.resize(roi, (max(1, min(10, rw)), max(1, min(10, rh))),
-                                       interpolation=cv2.INTER_AREA)
-                    avg = small.mean(axis=(0, 1)).astype(np.float32)
-                    small = (small.astype(np.float32) * 0.6 + avg * 0.4).astype(np.uint8)
-                    pix = cv2.resize(small, (rw, rh), interpolation=cv2.INTER_LINEAR)
-                    frame[y1c:y2c, x1c:x2c] = (roi * (1 - mask) + pix * mask).astype(np.uint8)
-                elif censor_mode == "color_match":
-                    avg = roi.mean(axis=(0, 1)).astype(np.uint8)
-                    filled = np.full_like(roi, avg)
-                    frame[y1c:y2c, x1c:x2c] = (roi * (1 - mask) + filled * mask).astype(np.uint8)
-                else:
-                    frame[y1c:y2c, x1c:x2c] = (roi * (1 - mask)).astype(np.uint8)
+                fill = _censor_fill(roi, censor_mode)
+                frame[y1c:y2c, x1c:x2c] = (roi * (1 - mask) + fill * mask).astype(np.uint8)
 
             ov = OVERLAY_MAP.get(overlay_mode)
             if ov is not None:
@@ -1229,7 +1262,7 @@ class StreamInstance:
             if frame_count % detect_every == 0:
                 results = model.predict(frame, conf=conf, verbose=False,
                                         classes=list(ANIMAL_CLASS_IDS),
-                                        imgsz=480)
+                                        imgsz=DETECT_IMGSZ)
                 raw_boxes = []
                 raw_classes = []
                 for r in results:
@@ -1260,37 +1293,8 @@ class StreamInstance:
                 roi = frame[y1c:y2c, x1c:x2c]
                 radius = max(12, min(rh, rw) // 6)
                 mask = rounded_rect_mask(rh, rw, radius)[:, :, None]
-                if censor_mode == "blur":
-                    tiny = cv2.resize(roi, (max(1, rw // 40), max(1, rh // 40)),
-                                      interpolation=cv2.INTER_AREA)
-                    blurred = cv2.resize(tiny, (rw, rh), interpolation=cv2.INTER_LINEAR)
-                    ksize = max(51, (min(rh, rw) // 3) | 1)
-                    blurred = cv2.GaussianBlur(blurred, (ksize, ksize), 0)
-                    avg = blurred.mean(axis=(0, 1)).astype(np.float32)
-                    blurred = (blurred.astype(np.float32) * 0.3 + avg * 0.7).astype(np.uint8)
-                    frame[y1c:y2c, x1c:x2c] = (roi * (1 - mask) + blurred * mask).astype(np.uint8)
-                elif censor_mode == "fine_blur":
-                    tiny = cv2.resize(roi, (max(1, rw // 12), max(1, rh // 12)),
-                                      interpolation=cv2.INTER_AREA)
-                    blurred = cv2.resize(tiny, (rw, rh), interpolation=cv2.INTER_LINEAR)
-                    ksize = max(31, (min(rh, rw) // 5) | 1)
-                    blurred = cv2.GaussianBlur(blurred, (ksize, ksize), 0)
-                    avg = blurred.mean(axis=(0, 1)).astype(np.float32)
-                    blurred = (blurred.astype(np.float32) * 0.5 + avg * 0.5).astype(np.uint8)
-                    frame[y1c:y2c, x1c:x2c] = (roi * (1 - mask) + blurred * mask).astype(np.uint8)
-                elif censor_mode == "pixelate":
-                    small = cv2.resize(roi, (max(1, min(10, rw)), max(1, min(10, rh))),
-                                       interpolation=cv2.INTER_AREA)
-                    avg = small.mean(axis=(0, 1)).astype(np.float32)
-                    small = (small.astype(np.float32) * 0.6 + avg * 0.4).astype(np.uint8)
-                    pix = cv2.resize(small, (rw, rh), interpolation=cv2.INTER_LINEAR)
-                    frame[y1c:y2c, x1c:x2c] = (roi * (1 - mask) + pix * mask).astype(np.uint8)
-                elif censor_mode == "color_match":
-                    avg = roi.mean(axis=(0, 1)).astype(np.uint8)
-                    filled = np.full_like(roi, avg)
-                    frame[y1c:y2c, x1c:x2c] = (roi * (1 - mask) + filled * mask).astype(np.uint8)
-                else:
-                    frame[y1c:y2c, x1c:x2c] = (roi * (1 - mask)).astype(np.uint8)
+                fill = _censor_fill(roi, censor_mode)
+                frame[y1c:y2c, x1c:x2c] = (roi * (1 - mask) + fill * mask).astype(np.uint8)
 
             ov = OVERLAY_MAP.get(overlay_mode)
             if ov is not None:
@@ -2157,19 +2161,16 @@ No channels discovered yet. Configure M3U source below and click Fetch Now.
 <div class="row"><label>Detect Every N</label><input type="range" id="detectEvery" min="1" max="10" step="1" value="2"><span class="val" id="detectEveryVal">2</span></div>
 <div class="setting-desc">Run YOLO every Nth frame. Higher = less CPU, but slower to detect new animals. BoxTracker fills gaps.</div>
 <div class="row"><label>YOLO Model</label><select id="model">
-<option value="yolov8n_openvino_model">yolov8n (fast)</option>
-<option value="yolov8s_openvino_model" selected>yolov8s (balanced)</option>
-<option value="yolov8m_openvino_model">yolov8m (accurate)</option>
-<option value="yolov8l_openvino_model">yolov8l (heavy)</option>
-<option value="yolov8x_openvino_model">yolov8x (max accuracy)</option>
+<option value="yolov8n_openvino_model">yolov8n (fastest, weakest)</option>
+<option value="yolov8s_openvino_model">yolov8s (balanced)</option>
+<option value="yolov8m_openvino_model" selected>yolov8m (recommended)</option>
+<option value="yolov8l_openvino_model">yolov8l (best detection)</option>
 </select></div>
 <div class="setting-desc">YOLOv8 model size (OpenVINO). Larger = more accurate but uses more CPU. Export with export_model.py first.</div>
 <div class="row"><label>Censor Style</label><select id="censorMode">
 <option value="black">Black box</option>
 <option value="blur">Blur</option>
-<option value="fine_blur">Fine Blur</option>
 <option value="pixelate" selected>Pixelate</option>
-<option value="color_match">Color match</option>
 </select></div>
 <div class="setting-desc">How detected animals are hidden in the video output.</div>
 </div></div>
@@ -2458,6 +2459,10 @@ def api_start(slug):
     stream.stop()
     time.sleep(0.5)
     stream.stop_event.clear()
+    # Seed the client clock — the watchdog only considers streams with a
+    # non-zero last_client_request, so a stream started here would otherwise
+    # never be eligible for auto-stop and would run until manually stopped.
+    stream.touch_client(request.remote_addr)
     stream.start()
     return jsonify({"ok": True})
 
@@ -2515,7 +2520,7 @@ def api_settings():
             config["model"] = str(data["model"])
         if "overlay" in data and data["overlay"] in ("none", "text", "graphic", "petfree", "paw", "censored", "shield", "tvrating", "cleanstream", "lock", "filmstrip", "nocat", "poweredby", "eyeslash", "filtered", "nohorse", "nodog", "nopaw", "animalfree"):
             config["overlay"] = data["overlay"]
-        if "censor_mode" in data and data["censor_mode"] in ("black", "blur", "fine_blur", "pixelate", "color_match"):
+        if "censor_mode" in data and data["censor_mode"] in CENSOR_MODES:
             config["censor_mode"] = data["censor_mode"]
         if "channel_filters" in data:
             config["channel_filters"] = [f.strip().lower() for f in data["channel_filters"] if f.strip()]
