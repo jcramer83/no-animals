@@ -24,6 +24,7 @@ import subprocess
 import re
 import urllib.request
 import urllib.error
+from collections import deque
 from datetime import datetime
 import numpy as np
 import cv2
@@ -63,6 +64,19 @@ PIXELATE_BLOCKS = 6
 PIXELATE_FLOOD = 0.35
 
 CENSOR_MODES = ("black", "pixelate", "blur")
+
+# --- Realtime health ---
+# A pipeline that falls below realtime cannot recover on its own: the encoder
+# keeps emitting, but slower than the player consumes, so the 32s rolling HLS
+# window drains and playback freezes with no error anywhere. Detect it and
+# restart, which is what fixes it by hand.
+HEALTH_WINDOW = 60        # seconds of history behind the rate estimate
+HEALTH_MIN_RATIO = 0.85   # sustained below this = falling behind
+HEALTH_GRACE = 90         # skip judgement this long after a pipeline starts
+HEALTH_MAX_RESTARTS = 3   # per rolling hour, then stop trying and report
+HEALTH_STRIKES = 3        # consecutive failing checks before acting (~30s)
+HEALTH_CRITICAL_RATIO = 0.35  # this far below realtime, act on the first check
+HEALTH_TICK = 10          # watchdog cadence; also the sampling interval
 
 MAX_STREAMS = 10
 MAX_VOD_PIPELINES = 3
@@ -577,6 +591,11 @@ class StreamInstance:
         self._discontinuities = []  # segment numbers where #EXT-X-DISCONTINUITY is needed
         self.last_frame_jpeg = None # latest processed frame as JPEG bytes (for preview)
         self._pipeline_gen = 0     # incremented each pipeline start, used to cancel stale cleanups
+        self.target_fps = FPS       # set from probe once the pipeline starts
+        self._health = deque()      # (wall_time, frame_count) for the realtime check
+        self._health_started = 0.0  # when the current main loop began
+        self._health_restarts = []  # timestamps of auto-restarts, for rate limiting
+        self._health_strikes = 0    # consecutive below-threshold checks
 
     def touch_client(self, ip):
         now = time.time()
@@ -587,6 +606,30 @@ class StreamInstance:
     def active_client_count(self):
         cutoff = time.time() - 15
         return sum(1 for t in self.client_ips.values() if t > cutoff)
+
+    def health_ratio(self):
+        """Content produced per second of wall clock over the recent window.
+
+        1.0 means keeping pace with realtime, >1 means catching up on the
+        source's DVR backlog, <1 means losing ground. Deliberately computed
+        over a rolling window rather than cumulatively: a cumulative average
+        stays healthy-looking for a long time after a collapse, because the
+        fast catch-up right after startup drags it upward.
+
+        Returns None while there is too little history to judge.
+        """
+        if len(self._health) < 2:
+            return None
+        now = time.time()
+        recent = [s for s in self._health if s[0] >= now - HEALTH_WINDOW]
+        if len(recent) < 2:
+            return None
+        (t0, f0), (t1, f1) = recent[0], recent[-1]
+        dt = t1 - t0
+        if dt < HEALTH_WINDOW * 0.5:
+            return None
+        target = self.target_fps or FPS
+        return ((f1 - f0) / dt) / target
 
     def start(self):
         with self._pipeline_lock:
@@ -858,6 +901,8 @@ class StreamInstance:
             self.stats["status"] = "running"
             self.stats["last_error"] = ""
 
+        self._health.clear()
+        self._health_started = time.time()
         print(f"[{tag}] main loop started", flush=True)
 
         # -------------------------------------------------------------------
@@ -967,7 +1012,9 @@ class StreamInstance:
                     self.stats["uptime"] = round(time.time() - start_time, 1)
                     self.stats["active_clients"] = self.active_client_count
                     self.stats["animal_counts"] = dict(animal_counts)
-                print(f"[{tag}] frames={frame_count} fps={cur_fps}", flush=True)
+                    ratio = self.stats.get("realtime_ratio")
+                rtxt = f" realtime={ratio:.2f}x" if ratio is not None else ""
+                print(f"[{tag}] frames={frame_count} fps={cur_fps}{rtxt}", flush=True)
                 fps_clock = now
 
         # --- Cleanup ---
@@ -1334,7 +1381,9 @@ class StreamInstance:
                     self.stats["uptime"] = round(time.time() - start_time, 1)
                     self.stats["active_clients"] = self.active_client_count
                     self.stats["animal_counts"] = dict(animal_counts)
-                print(f"[{tag}] frames={frame_count} fps={cur_fps}", flush=True)
+                    ratio = self.stats.get("realtime_ratio")
+                rtxt = f" realtime={ratio:.2f}x" if ratio is not None else ""
+                print(f"[{tag}] frames={frame_count} fps={cur_fps}{rtxt}", flush=True)
                 fps_clock = now
 
         # --- Cleanup ---
@@ -1974,6 +2023,126 @@ def m3u_refresh_loop():
 # ---------------------------------------------------------------------------
 # Watchdog
 # ---------------------------------------------------------------------------
+
+def _snapshot_logs(inst, reason):
+    """Copy a pipeline's ffmpeg logs somewhere they survive a restart.
+
+    run_pipeline() rmtree's the output dir on start and drain_stderr opens the
+    logs with mode 'w', so without this the evidence for a failure is destroyed
+    by the very restart that recovers from it.
+    """
+    try:
+        dest = Path("./stream_output/_diagnostics")
+        dest.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        for name in ("decoder.log", "encoder.log"):
+            src = inst.out_dir / name
+            if src.exists():
+                shutil.copy2(src, dest / f"{stamp}_{inst.slug}_{name}")
+        (dest / f"{stamp}_{inst.slug}_reason.txt").write_text(reason + "\n")
+        keep = sorted(dest.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in keep[60:]:
+            try: old.unlink()
+            except Exception: pass
+        print(f"[health] [{inst.slug}] diagnostics saved to {dest}", flush=True)
+    except Exception as e:
+        print(f"[health] [{inst.slug}] could not save diagnostics: {e}", flush=True)
+
+
+def health_watchdog():
+    """Restart live pipelines that have fallen below realtime.
+
+    Such a pipeline never recovers on its own — it keeps emitting, just slower
+    than the player consumes, until the rolling HLS window drains and playback
+    freezes with no error logged anywhere. Restarting is what fixes it by hand,
+    so do that automatically and keep the logs that explain why.
+    """
+    while True:
+        time.sleep(HEALTH_TICK)
+        with streams_lock:
+            stream_list = list(streams.values())
+        for s in stream_list:
+            if s.is_vod:
+                continue
+            with s.stats_lock:
+                st = s.stats["status"]
+                frames = s.stats["frames_processed"]
+            if st != "running":
+                s._health.clear()
+                s._health_strikes = 0
+                continue
+
+            # Sample here rather than in the main loop: a pipeline that has
+            # fallen behind also reports less often, which starved the
+            # measurement exactly when it was needed.
+            sample_t = time.time()
+            # frames_processed restarts at 0 with each pipeline. If that happens
+            # between two ticks the delta goes negative, which would look like a
+            # catastrophic ratio and trigger an immediate restart loop.
+            if s._health and frames < s._health[-1][1]:
+                s._health.clear()
+                s._health_strikes = 0
+                s._health_started = sample_t
+            s._health.append((sample_t, frames))
+            while s._health and s._health[0][0] < sample_t - HEALTH_WINDOW * 2:
+                s._health.popleft()
+            ratio = s.health_ratio()
+            with s.stats_lock:
+                s.stats["realtime_ratio"] = round(ratio, 3) if ratio is not None else None
+
+            # Give the pipeline time to load the model and drain any backlog.
+            if sample_t - s._health_started < HEALTH_GRACE:
+                continue
+            # Nothing watching: the client watchdog will stop it shortly anyway.
+            if s.active_client_count == 0:
+                continue
+            if ratio is None or ratio >= HEALTH_MIN_RATIO:
+                s._health_strikes = 0
+                continue
+            # Require the deficit to persist, unless it is catastrophic — a
+            # brief source stall can drag the rolling window under the floor
+            # without the pipeline being sick.
+            s._health_strikes += 1
+            needed = 1 if ratio < HEALTH_CRITICAL_RATIO else HEALTH_STRIKES
+            if s._health_strikes < needed:
+                print(f"[health] [{s.slug}] {ratio:.2f}x realtime "
+                      f"(strike {s._health_strikes}/{needed})", flush=True)
+                continue
+
+            now = time.time()
+            s._health_restarts = [t for t in s._health_restarts if t > now - 3600]
+            reason = (f"{s.slug} producing {ratio:.2f}x realtime "
+                      f"(target {s.target_fps:.1f}fps, floor {HEALTH_MIN_RATIO}x) — "
+                      f"playlist window will drain and freeze players")
+            if len(s._health_restarts) >= HEALTH_MAX_RESTARTS:
+                print(f"[health] [{s.slug}] STILL BEHIND at {ratio:.2f}x after "
+                      f"{HEALTH_MAX_RESTARTS} restarts this hour — not restarting again. "
+                      f"Lower detect_every or use a smaller model.", flush=True)
+                with s.stats_lock:
+                    s.stats["last_error"] = (f"Below realtime ({ratio:.2f}x) after "
+                                             f"{HEALTH_MAX_RESTARTS} restarts — reduce load")
+                continue
+
+            print(f"[health] [{s.slug}] {reason}", flush=True)
+            _snapshot_logs(s, reason)
+            s._health_restarts.append(now)
+
+            s.stop()
+            for _ in range(60):  # up to 6s for the old pipeline to exit
+                with s.stats_lock:
+                    if s.stats["status"] not in ("running", "probing"):
+                        break
+                time.sleep(0.1)
+            s._health.clear()
+            s._health_started = time.time()
+            s._health_strikes = 0
+            s.stop_event.clear()
+            with s.stats_lock:
+                s.stats["status"] = "listening"
+            s.start()
+            print(f"[health] [{s.slug}] pipeline restarted "
+                  f"({len(s._health_restarts)}/{HEALTH_MAX_RESTARTS} this hour)", flush=True)
+
 
 def client_watchdog():
     """Background thread: stop streams with no client requests for CLIENT_TIMEOUT seconds."""
@@ -3276,4 +3445,5 @@ if __name__ == "__main__":
     print(f"Dashboard: http://localhost:8080")
     threading.Thread(target=m3u_refresh_loop, daemon=True).start()
     threading.Thread(target=client_watchdog, daemon=True).start()
+    threading.Thread(target=health_watchdog, daemon=True).start()
     app.run(host="0.0.0.0", port=8080, debug=False, threaded=True)
