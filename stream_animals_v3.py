@@ -480,8 +480,9 @@ _default_config = {
     "live_buffer_segments": 8,
     # Concurrent live pipelines. Each one needs its own realtime budget; running
     # more than the box can sustain puts ALL of them below realtime and freezes
-    # every viewer at once.
-    "max_concurrent_live": 2,
+    # every viewer at once. 1 means switching channels stops the previous one,
+    # so whatever is actually being watched gets the whole machine.
+    "max_concurrent_live": 1,
 }
 
 
@@ -2088,24 +2089,31 @@ def _enforce_live_concurrency(incoming):
     one channel giving up. VOD has had this cap all along; live never did.
     """
     with config_lock:
-        cap = int(config.get("max_concurrent_live", 2))
+        cap = int(config.get("max_concurrent_live", 1))
     if cap <= 0:
         return
     with streams_lock:
         running = [s for s in streams.values()
-                   if s is not incoming and not s.is_vod and s.stats.get("status") in ("running", "probing")]
-    if len(running) < cap:
+                   if s is not incoming and not s.is_vod
+                   and s.stats.get("status") in ("running", "probing")]
+    # Evict enough that the incoming stream also fits, not just one. Evicting a
+    # single victim leaves the cap exceeded whenever more than one pipeline is
+    # already up — which happens if the cap is lowered at runtime.
+    surplus = len(running) - cap + 1
+    if surplus <= 0:
         return
-    # Evict the one nobody has asked for in the longest time.
-    victim = min(running, key=lambda s: s.last_client_request)
-    idle = time.time() - victim.last_client_request
-    print(f"[concurrency] {len(running)} live pipelines already running (cap {cap}); "
-          f"stopping '{victim.slug}' (idle {idle:.0f}s) to make room for '{incoming.slug}'", flush=True)
-    victim.stop()
-    with victim.stats_lock:
-        victim.stats["status"] = "listening"
-        victim.stats["last_error"] = f"Stopped to free capacity for '{incoming.slug}'"
-    victim.last_client_request = 0.0
+    # Stalest first: whoever has gone longest without a client request.
+    for victim in sorted(running, key=lambda s: s.last_client_request)[:surplus]:
+        idle = time.time() - victim.last_client_request if victim.last_client_request else -1
+        print(f"[concurrency] cap {cap}, {len(running)} live running — stopping "
+              f"'{victim.slug}' (idle {idle:.0f}s) for '{incoming.slug}'", flush=True)
+        victim.stop()
+        with victim.stats_lock:
+            victim.stats["status"] = "listening"
+            victim.stats["last_error"] = f"Stopped so '{incoming.slug}' gets full capacity"
+        victim.last_client_request = 0.0
+        victim._health.clear()
+        victim._health_strikes = 0
 
 
 def _snapshot_logs(inst, reason):
@@ -2721,6 +2729,7 @@ def api_start(slug):
         stream = streams.get(slug)
     if not stream:
         return jsonify({"error": f"Unknown stream '{slug}'"}), 404
+    _enforce_live_concurrency(stream)
     stream.stop()
     time.sleep(0.5)
     stream.stop_event.clear()
