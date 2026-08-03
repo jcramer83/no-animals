@@ -790,7 +790,10 @@ class StreamInstance:
             start_num = self.hls_start_number
         else:
             hls_playlist_type = None
-            hls_list_size = "8"
+            # Long enough that a player honouring EXT-X-START can begin
+            # ~30s back and still have segments behind it. 8 (32s) left no
+            # room to start anywhere but the live edge.
+            hls_list_size = "15"
             hls_flags = "delete_segments+omit_endlist"
             start_num = int(time.time()) % 100000
         enc_cmd += [
@@ -822,17 +825,11 @@ class StreamInstance:
         dec_cmd = [FFMPEG, "-y"]
         if self.seek_offset > 0:
             dec_cmd += ["-ss", f"{self.seek_offset:.3f}"]
-        if not self.is_vod:
-            with config_lock:
-                buf_segs = int(config.get("live_buffer_segments", 8))
-            if buf_segs > 0:
-                # Begin this far back in the provider's playlist, then read at
-                # native rate so the offset is held instead of being consumed.
-                # Without -re the decoder races to the live edge in a couple of
-                # minutes and the cushion is gone exactly when it is needed.
-                # -live_start_index is an HLS demuxer option and must precede -i.
-                dec_cmd += ["-live_start_index", str(-buf_segs), "-re"]
-                self.live_buffer_s = buf_segs * 4
+        # NOTE: do not try to start behind the source's live edge here. Provider
+        # URLs are continuous MPEG-TS pushes, not HLS playlists, so there is no
+        # backlog to rewind into and -live_start_index is rejected outright
+        # ("Option not found") because it belongs to the HLS demuxer. The viewer
+        # cushion is built on the output side instead — see _live_start_offset().
         dec_cmd += _build_decoder_hwaccel_args(hwaccel)
         # No codec hint — let FFmpeg auto-detect for both live and VOD
 
@@ -2053,6 +2050,35 @@ def m3u_refresh_loop():
 # Watchdog
 # ---------------------------------------------------------------------------
 
+def _inject_live_start(lines, inst):
+    """Tell players to begin behind the live edge, giving them a buffer.
+
+    The provider feed is a continuous MPEG-TS push, so there is no upstream
+    playlist to rewind into — the cushion has to be created on our own output.
+    A player left to itself starts ~3 segments from the end, roughly 12s of
+    runway, and the captured logs show stalls of 30-45s. EXT-X-START moves the
+    start point back so a stall drains slack instead of freezing playback.
+
+    Costs the same number of seconds in latency behind live, which for this
+    content is irrelevant.
+    """
+    if inst.is_vod:
+        return lines
+    with config_lock:
+        segs = int(config.get("live_buffer_segments", 8))
+    if segs <= 0:
+        return lines
+    offset = segs * 4
+    inst.live_buffer_s = offset
+    if any(l.startswith("#EXT-X-START") for l in lines):
+        return lines
+    # Must precede the first segment; sits naturally right after #EXTM3U.
+    out = list(lines)
+    at = 1 if out and out[0].startswith("#EXTM3U") else 0
+    out.insert(at, f"#EXT-X-START:TIME-OFFSET=-{offset},PRECISE=YES")
+    return out
+
+
 def _enforce_live_concurrency(incoming):
     """Make room for `incoming` by stopping the stalest live pipeline.
 
@@ -2684,6 +2710,7 @@ def stream_file(slug, filename):
                 lines.append(f"{base}/stream/{slug}/{line}")
             else:
                 lines.append(line)
+        lines = _inject_live_start(lines, stream)
         return Response("\n".join(lines) + "\n", content_type="application/vnd.apple.mpegurl")
     return send_from_directory(str(stream.out_dir.resolve()), filename, mimetype="video/mp2t")
 
