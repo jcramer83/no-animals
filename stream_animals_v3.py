@@ -473,6 +473,15 @@ _default_config = {
     "detect_every": 4,
     "channel_filters": ["hallmark"],
     "excluded_channels": [],
+    # Start the decoder this many segments behind the provider's live edge and
+    # hold that offset, so the pipeline always has already-published source to
+    # chew on. A provider stall then drains the cushion instead of freezing the
+    # player. ~4s per segment, so 8 == roughly 30s of slack. 0 disables.
+    "live_buffer_segments": 8,
+    # Concurrent live pipelines. Each one needs its own realtime budget; running
+    # more than the box can sustain puts ALL of them below realtime and freezes
+    # every viewer at once.
+    "max_concurrent_live": 2,
 }
 
 
@@ -602,6 +611,7 @@ class StreamInstance:
         self._health = deque()      # (wall_time, frame_count) for the realtime check
         self._health_started = 0.0  # when the current main loop began
         self._health_restarts = []  # timestamps of auto-restarts, for rate limiting
+        self.live_buffer_s = 0      # seconds behind the live edge, for reporting
         self._health_strikes = 0    # consecutive below-threshold checks
 
     def touch_client(self, ip):
@@ -812,6 +822,17 @@ class StreamInstance:
         dec_cmd = [FFMPEG, "-y"]
         if self.seek_offset > 0:
             dec_cmd += ["-ss", f"{self.seek_offset:.3f}"]
+        if not self.is_vod:
+            with config_lock:
+                buf_segs = int(config.get("live_buffer_segments", 8))
+            if buf_segs > 0:
+                # Begin this far back in the provider's playlist, then read at
+                # native rate so the offset is held instead of being consumed.
+                # Without -re the decoder races to the live edge in a couple of
+                # minutes and the cushion is gone exactly when it is needed.
+                # -live_start_index is an HLS demuxer option and must precede -i.
+                dec_cmd += ["-live_start_index", str(-buf_segs), "-re"]
+                self.live_buffer_s = buf_segs * 4
         dec_cmd += _build_decoder_hwaccel_args(hwaccel)
         # No codec hint — let FFmpeg auto-detect for both live and VOD
 
@@ -2032,6 +2053,35 @@ def m3u_refresh_loop():
 # Watchdog
 # ---------------------------------------------------------------------------
 
+def _enforce_live_concurrency(incoming):
+    """Make room for `incoming` by stopping the stalest live pipeline.
+
+    Each live pipeline needs its own realtime budget. Running more than the box
+    can sustain does not degrade gracefully — every pipeline drops below
+    realtime together and every viewer freezes at once, which is worse than
+    one channel giving up. VOD has had this cap all along; live never did.
+    """
+    with config_lock:
+        cap = int(config.get("max_concurrent_live", 2))
+    if cap <= 0:
+        return
+    with streams_lock:
+        running = [s for s in streams.values()
+                   if s is not incoming and not s.is_vod and s.stats.get("status") in ("running", "probing")]
+    if len(running) < cap:
+        return
+    # Evict the one nobody has asked for in the longest time.
+    victim = min(running, key=lambda s: s.last_client_request)
+    idle = time.time() - victim.last_client_request
+    print(f"[concurrency] {len(running)} live pipelines already running (cap {cap}); "
+          f"stopping '{victim.slug}' (idle {idle:.0f}s) to make room for '{incoming.slug}'", flush=True)
+    victim.stop()
+    with victim.stats_lock:
+        victim.stats["status"] = "listening"
+        victim.stats["last_error"] = f"Stopped to free capacity for '{incoming.slug}'"
+    victim.last_client_request = 0.0
+
+
 def _snapshot_logs(inst, reason):
     """Copy a pipeline's ffmpeg logs somewhere they survive a restart.
 
@@ -2602,6 +2652,7 @@ def stream_file(slug, filename):
         # Auto-start on first client request
         just_started = False
         if st == "listening":
+            _enforce_live_concurrency(stream)
             print(f"[auto-start] [{slug}] client requested {filename}, starting pipeline", flush=True)
             stream.start()
             just_started = True
@@ -2709,6 +2760,16 @@ def api_settings():
             config["overlay"] = data["overlay"]
         if "censor_mode" in data and data["censor_mode"] in CENSOR_MODES:
             config["censor_mode"] = data["censor_mode"]
+        if "live_buffer_segments" in data:
+            try:
+                config["live_buffer_segments"] = max(0, min(int(data["live_buffer_segments"]), 60))
+            except (TypeError, ValueError):
+                pass
+        if "max_concurrent_live" in data:
+            try:
+                config["max_concurrent_live"] = max(0, min(int(data["max_concurrent_live"]), MAX_STREAMS))
+            except (TypeError, ValueError):
+                pass
         if "channel_filters" in data:
             config["channel_filters"] = [f.strip().lower() for f in data["channel_filters"] if f.strip()]
             filters_changed = True
@@ -2724,6 +2785,78 @@ def api_settings():
 @app.route("/api/overlay/preview")
 def api_overlay_preview():
     return jsonify(OVERLAY_PREVIEWS)
+
+
+@app.route("/api/health")
+def api_health():
+    """Everything needed to diagnose a freeze without shelling into the container.
+
+    Per stream: the realtime ratio plus the raw samples behind it, how far
+    behind the live edge it is running, and its auto-restart history.
+    """
+    with config_lock:
+        cap = int(config.get("max_concurrent_live", 2))
+        buf = int(config.get("live_buffer_segments", 8))
+        cfg = {k: config.get(k) for k in
+               ("model", "confidence", "detect_every", "censor_mode", "padding", "persist_frames")}
+    now = time.time()
+    out = {"now": now, "max_concurrent_live": cap, "live_buffer_segments": buf,
+           "config": cfg, "streams": {}}
+    with streams_lock:
+        insts = list(streams.items())
+    running = 0
+    for slug, s in insts:
+        with s.stats_lock:
+            st = s.stats.get("status")
+            frames = s.stats.get("frames_processed", 0)
+            err = s.stats.get("last_error", "")
+            ratio = s.stats.get("realtime_ratio")
+        if st in ("running", "probing"):
+            running += 1
+        elif not err and not s._health_restarts:
+            continue  # idle and uneventful — omit to keep the response small
+        out["streams"][slug] = {
+            "status": st,
+            "is_vod": s.is_vod,
+            "frames": frames,
+            "realtime_ratio": ratio,
+            "ratio_60s": s.health_ratio(),
+            "ratio_30s": s.health_ratio(HEALTH_RECENT),
+            "target_fps": round(s.target_fps or 0, 2),
+            "behind_live_s": s.live_buffer_s,
+            "strikes": s._health_strikes,
+            "restarts_last_hour": len([t for t in s._health_restarts if t > now - 3600]),
+            "restart_ages_s": [round(now - t) for t in s._health_restarts[-5:]],
+            "active_clients": s.active_client_count,
+            "idle_s": round(now - s.last_client_request, 1) if s.last_client_request else None,
+            "samples": [[round(now - t, 1), f] for t, f in list(s._health)[-12:]],
+            "last_error": err,
+        }
+    out["running_live"] = running
+    return jsonify(out)
+
+
+@app.route("/api/diagnostics")
+def api_diagnostics():
+    """List (or fetch) the ffmpeg logs snapshotted before an auto-restart."""
+    d = Path("./stream_output/_diagnostics")
+    name = request.args.get("file")
+    if name:
+        target = d / Path(name).name          # basename only — no traversal
+        if not target.exists():
+            return "Not found", 404
+        tail = int(request.args.get("tail", 200))
+        try:
+            lines = target.read_text(errors="replace").splitlines()
+        except Exception as e:
+            return f"Unreadable: {e}", 500
+        return Response("\n".join(lines[-tail:]) + "\n", content_type="text/plain")
+    if not d.exists():
+        return jsonify({"files": []})
+    files = sorted(d.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+    return jsonify({"files": [{"name": p.name, "bytes": p.stat().st_size,
+                               "age_s": round(time.time() - p.stat().st_mtime)}
+                              for p in files[:60]]})
 
 
 @app.route("/api/stats")
